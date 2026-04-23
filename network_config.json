@@ -1,0 +1,6 @@
+{
+  "server_port": 8080,
+  "client_target_host": "127.0.0.1",
+  "client_target_port": 8080,
+  "server_bind_host": "127.0.0.1"
+}

@@ -1,0 +1,7 @@
+mss>=9.0.1
+Pillow>=10.3.0
+pynput>=1.7.6
+websockets>=12.0
+pystray>=0.19.5
+pyperclip>=1.8.2
+pyinstaller>=6.6.0
