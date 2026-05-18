@@ -269,10 +269,40 @@ class Manager:
             print("  [X] Build failed:")
             print(result.stderr.decode()[-1500:])
 
+    def _ensure_deps(self, packages):
+        missing = []
+        for pkg in packages:
+            try:
+                __import__(pkg)
+            except ImportError:
+                missing.append(pkg)
+        if not missing:
+            return True
+        print(f"  [!] Missing server deps: {', '.join(missing)}")
+        ans = input("  Install now? [Y/n]: ").strip().lower()
+        if ans == "n":
+            return False
+        for pkg in missing:
+            pip_name = pkg
+            if pkg in ("cryptography",):
+                pip_name = "pycryptodome"
+            print(f"  Installing {pip_name}...")
+            r = subprocess.run(
+                [sys.executable, "-m", "pip", "install", pip_name],
+                capture_output=True, timeout=120,
+            )
+            if r.returncode != 0:
+                print(f"  [X] Failed to install {pip_name}: {r.stderr.decode()[-200:]}")
+                return False
+        print("  [+] Dependencies installed")
+        return True
+
     def start_server(self, ip=None, port=None):
         print("\n--- Starting Server ---")
         ip = ip or self.config["server_ip"]
         port = port or self.config["server_port"]
+        if not self._ensure_deps(["fastapi", "uvicorn", "websockets"]):
+            return
         self._kill_port(port)
         env = {**os.environ, "HOST": ip, "PORT": str(port)}
         p = subprocess.Popen(
