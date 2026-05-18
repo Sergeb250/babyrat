@@ -139,12 +139,32 @@ class Manager:
         print(f"  [+] Generated {spec_file}")
         return spec_file
 
+    def _find_pyinstaller(self):
+        candidates = ["pyinstaller", "pyinstaller3"]
+        for c in candidates:
+            if shutil.which(c):
+                return [c]
+        try:
+            subprocess.run(
+                [sys.executable, "-m", "PyInstaller", "--version"],
+                capture_output=True, timeout=10,
+            )
+            return [sys.executable, "-m", "PyInstaller"]
+        except:
+            return None
+
     def build_agent(self):
         print("\n--- Building Standalone Agent ---")
         self.patch_client()
         spec = self.generate_spec()
-        print("  Running PyInstaller...")
-        cmd = ["pyinstaller", "--noconfirm", spec]
+
+        pyinst = self._find_pyinstaller()
+        if not pyinst:
+            print("  [X] PyInstaller not installed. Run: pip install pyinstaller")
+            return
+
+        print(f"  Running PyInstaller...")
+        cmd = pyinst + ["--noconfirm", spec]
 
         result = subprocess.run(cmd, capture_output=True, timeout=600)
         if result.returncode == 0:
