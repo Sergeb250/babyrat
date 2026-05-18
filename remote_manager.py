@@ -269,10 +269,10 @@ class Manager:
             print("  [X] Build failed:")
             print(result.stderr.decode()[-1500:])
 
-    def start_server(self):
+    def start_server(self, ip=None, port=None):
         print("\n--- Starting Server ---")
-        ip = self.config["server_ip"]
-        port = self.config["server_port"]
+        ip = ip or self.config["server_ip"]
+        port = port or self.config["server_port"]
         self._kill_port(port)
         env = {**os.environ, "HOST": ip, "PORT": str(port)}
         p = subprocess.Popen(
@@ -341,6 +341,21 @@ class Manager:
         v = input(f"  {prompt} [{current}]: ").strip()
         return v if v else current
 
+    def _pick_interface(self):
+        ips = get_local_ips()
+        print("\n  Available network interfaces:")
+        for i, ip in enumerate(ips):
+            mark = " (current)" if ip == self.config["server_ip"] else ""
+            print(f"    [{i}] {ip}{mark}")
+        print(f"    [C] Custom IP")
+        print(f"    [Enter] Keep current ({self.config['server_ip']})")
+        ch = input("  Choose interface: ").strip().lower()
+        if ch == "c":
+            return input("  Enter custom IP: ").strip() or self.config["server_ip"]
+        if ch.isdigit() and int(ch) < len(ips):
+            return ips[int(ch)]
+        return self.config["server_ip"]
+
     def run(self):
         while True:
             ch = self.show_menu()
@@ -383,7 +398,12 @@ class Manager:
                 c["stealth"] = not c["stealth"]
             elif ch == "s":
                 self.save_config()
-                self.start_server()
+                ip = self._pick_interface()
+                port = input(f"  Port [{self.config['server_port']}]: ").strip() or self.config["server_port"]
+                self.config["server_ip"] = ip
+                self.config["server_port"] = port
+                self.save_config()
+                self.start_server(ip=ip, port=port)
                 input("\n  Press Enter...")
             elif ch == "t":
                 self.stop_server()
