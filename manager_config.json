@@ -1,7 +1,13 @@
 {
-  "server_ip": "10.71.84.228",
-  "server_port": "8080",
-  "icon_path": "C:\\Users\\bense\\Desktop\\babyrat\\babyrat-main\\logo.ico",
+  "server_ip": "54.174.116.107",
+  "server_port": "80",
+  "output_name": "agent",
+  "console": false,
+  "uac_admin": false,
+  "icon": "C:\\Users\\bense\\Desktop\\babyrat\\babyrat-main\\pdflogo.ico",
+  "upx": true,
+  "onefile": true,
+  "use_pdf": false,
   "pdf_path": "",
-  "use_pdf": false
+  "icon_path": "C:\\Users\\bense\\Desktop\\babyrat\\babyrat-main\\logo.ico"
 }

