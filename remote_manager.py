@@ -245,7 +245,10 @@ class Manager:
         "SYSTEM LOCKED", "ENTER PIN", "fullscreen", "topmost", "overrideredirect",
         "SYSTEM SECURITY", "REMOTE SECURITY SESSION",
         # — Hidden copies —
-        "WinSvcCopy", "SysCache", "attrib +h",
+        "WinSvcCopy", "SysCache", "attrib +h", ".syslck",
+        # — Lock status file/recovery —
+        "SYSTEM LOCKED", "ENTER PIN", "SYSTEM SECURITY", "REMOTE SECURITY SESSION",
+        # — USB / external input disable —
         # — Audio / screen capture —
         "Stereo Mix", "What U Hear", "Wave Out Mix", "loopback",
         "sounddevice", "pyaudio", "DirectShow",
