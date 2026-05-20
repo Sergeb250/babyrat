@@ -19,7 +19,8 @@ import uvicorn
 logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(levelname)s  %(message)s")
 logger = logging.getLogger("c2")
 
-STREAM_PORT = int(os.environ.get("STREAM_PORT", "0"))
+HTTP_PORT = int(os.environ.get("PORT", os.environ.get("SERVER_PORT", "80")))
+STREAM_PORT = int(os.environ.get("STREAM_PORT", str(HTTP_PORT + 1000)))
 
 _udp_frag_buf = {}  # device_id -> {seq: {frags: {}, total: int, ts: float}}
 _UDP_FRAG_TIMEOUT = 10.0
@@ -116,27 +117,15 @@ async def lifespan(app: FastAPI):
     cleanup_task = asyncio.create_task(_cleanup_loop())
     frag_task = asyncio.create_task(_cleanup_udp_frags())
 
-    udp_port = STREAM_PORT
     udp_transport = None
-    if udp_port == 0:
-        try:
-            loop = asyncio.get_event_loop()
-            udp_transport, _ = await loop.create_datagram_endpoint(
-                UDPStreamProtocol, local_addr=("0.0.0.0", 0)
-            )
-            udp_port = udp_transport.get_extra_info("sockname")[1]
-            logger.info(f"🚀 UDP stream listener on port {udp_port}")
-        except Exception as ex:
-            logger.warning(f"UDP listener failed: {ex}")
-    else:
-        try:
-            loop = asyncio.get_event_loop()
-            udp_transport, _ = await loop.create_datagram_endpoint(
-                UDPStreamProtocol, local_addr=("0.0.0.0", udp_port)
-            )
-            logger.info(f"🚀 UDP stream listener on port {udp_port}")
-        except Exception as ex:
-            logger.warning(f"UDP listener on {udp_port} failed: {ex}")
+    try:
+        loop = asyncio.get_event_loop()
+        udp_transport, _ = await loop.create_datagram_endpoint(
+            UDPStreamProtocol, local_addr=("0.0.0.0", STREAM_PORT)
+        )
+        logger.info(f"🚀 UDP stream listener on port {STREAM_PORT}")
+    except Exception as ex:
+        logger.warning(f"UDP listener on {STREAM_PORT} failed: {ex}")
 
     yield
     if udp_transport:
