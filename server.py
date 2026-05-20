@@ -258,6 +258,7 @@ class ServerState:
 
 
 state = ServerState()
+known_clients = {}  # device_id -> {hostname, os, status, first_seen, last_seen}
 
 # ─── Dashboard HTML ───────────────────────────────────────────
 DASHBOARD = """<!DOCTYPE html>
@@ -356,10 +357,15 @@ body::after{
 .nd{padding:12px 14px;background:rgba(20,24,42,.75);margin-bottom:8px;border-radius:10px;cursor:pointer;border:1px solid rgba(0,245,255,.12);transition:.2s;position:relative;overflow:hidden}
 .nd:hover{border-color:rgba(0,245,255,.4);box-shadow:0 0 20px rgba(0,245,255,.08)}
 .nd.act{border-color:var(--cyan);background:rgba(0,245,255,.06);box-shadow:0 0 24px rgba(0,245,255,.12)}
+.nd.offline{border-color:rgba(120,120,140,.15);opacity:.55}
+.nd.offline::before{background:linear-gradient(180deg,#555,#333)}
+.nd.offline:hover{opacity:.8;border-color:rgba(120,120,140,.3)}
 .nd::before{content:'';position:absolute;left:0;top:0;height:100%;width:3px;background:linear-gradient(180deg,var(--cyan),var(--magenta));border-radius:3px 0 0 3px}
 .nd b{color:#fff;font-size:12px;font-weight:700;font-family:'Consolas','Courier New',monospace}
 .nd .os{color:var(--muted);font-size:10px;margin-top:4px;display:block}
 .bg{font-size:8px;font-weight:800;padding:3px 10px;border-radius:20px;background:rgba(61,255,157,.12);color:var(--green);margin-top:6px;display:inline-block;letter-spacing:.6px;text-transform:uppercase;border:1px solid rgba(61,255,157,.25)}
+.bg.offline-badge{background:rgba(120,120,140,.1);color:#888;border-color:rgba(120,120,140,.2)}
+.last-seen{display:block;font-size:9px;color:#666;margin-top:2px}
 .es{padding:30px;color:var(--muted);font-size:12px;text-align:center;font-weight:600;letter-spacing:1px}
 
 #stage{flex:1;display:flex;overflow:hidden;min-height:0}
@@ -513,7 +519,10 @@ input[type=text]:focus{outline:none;border-color:var(--cyan);box-shadow:0 0 0 2p
 <div id="sidebar">
     <h2>◆ NODE MESH</h2>
     <div id="clist"><div class="es">AWAITING NODES...</div></div>
-    <div class="status-panel" id="statusBar">Status: awaiting nodes... <button onclick="sync()" style="float:right;background:none;border:1px solid var(--cyan);color:var(--cyan);border-radius:4px;padding:2px 8px;cursor:pointer;font-size:10px">⟳</button></div>
+    <div class="status-panel" id="statusBar">Status: awaiting nodes...</div>
+    <div id="disconnectBar" style="display:none;padding:4px 12px 8px">
+        <button onclick="doDisconnect()" style="width:100%;background:rgba(255,77,125,.15);color:#ff4d7d;border:1px solid rgba(255,77,125,.3);border-radius:6px;padding:6px;cursor:pointer;font-size:10px;font-weight:700;font-family:inherit">✕ Disconnect from current node</button>
+    </div>
     <div class="log-panel">
         <div class="log-header"><span>Server Logs</span><button class="bsm" onclick="loadLogs()">Refresh</button></div>
         <pre id="logArea">Loading logs...</pre>
@@ -747,11 +756,12 @@ function updateStatus(){
         statusEl.textContent = 'Status: no client selected';
         return;
     }
+    const session = window._sessions && window._sessions[aid];
     const host = document.getElementById('node_tag').textContent || aid;
     const mode = cv_mode === 'cam' ? 'Webcam' : 'Desktop';
     const audio = audio_enabled ? 'Audio ON' : 'Audio OFF';
     const mic = micEnabled ? 'Mic ON' : 'Mic OFF';
-    statusEl.textContent = `Status: viewing ${host} · ${mode} · ${audio} · ${mic}`;
+    statusEl.textContent = `Viewing: ${host} · ${mode} · ${audio} · ${mic}`;
 }
 
 function clearViewerReconnect(){
@@ -803,6 +813,7 @@ function sel(id,info){
     if(info.res)tres=info.res;
     document.getElementById('node_tag').style.display='inline-block';
     document.getElementById('node_tag').textContent=info.hostname.toUpperCase();
+    document.getElementById('disconnectBar').style.display='block';
     audio_enabled = false;
     const audioBtn = document.getElementById('pa');
     if(audioBtn) audioBtn.classList.remove('on');
@@ -1421,7 +1432,7 @@ async function sync(){
     try{
         const ctrl = new AbortController();
         setTimeout(()=>ctrl.abort(), 5000);
-        const r=await fetch('/clients', {signal: ctrl.signal});
+        const r=await fetch('/known_clients', {signal: ctrl.signal});
         const c=await r.json();
         const el=document.getElementById('clist');
         if(!el) return;
@@ -1429,21 +1440,39 @@ async function sync(){
         const ids=Object.keys(c);
         if(!ids.length){
             el.innerHTML='<div class="es">⏳ AWAITING NODES...</div>';
-            if(statusEl) statusEl.textContent='Status: no clients connected';
+            if(statusEl) statusEl.textContent='Status: no known agents';
             return;
         }
+        const online = Object.values(c).filter(v => v.status === 'online').length;
         if(!aid){
-            if(statusEl) statusEl.textContent=`Status: ${ids.length} client(s) connected`;
+            if(statusEl) statusEl.textContent=`Status: ${online} online / ${ids.length} total`;
         } else {
             updateStatus();
         }
-        ids.forEach(id=>{
+        const sorted = ids.sort((a,b) => {
+            const sa = c[a].status === 'online' ? 0 : 1;
+            const sb = c[b].status === 'online' ? 0 : 1;
+            return sa - sb;
+        });
+        sorted.forEach(id=>{
             const d=document.createElement('div');
-            d.className='nd'+(id===aid?' act':'');
-            const os=c[id].os||'';
-            const name=c[id].hostname||'Unknown';
-            d.innerHTML=`<b>${name}</b><span class="os">${os.length>30?os.substring(0,30)+'...':os}</span><span class="bg">⚡ online</span>`;
-            d.onclick=()=>sel(id,c[id]);
+            const info = c[id];
+            const active_class = id===aid ? ' act' : '';
+            const offline_class = info.status === 'offline' ? ' offline' : '';
+            d.className='nd'+active_class+offline_class;
+            const os = info.os || '';
+            const name = info.hostname || 'Unknown';
+            const online_badge = info.status === 'online'
+                ? '<span class="bg">⚡ online</span>'
+                : '<span class="bg offline-badge">⏻ offline</span>';
+            const lastSeen = info.status === 'offline'
+                ? '<span class="last-seen">last seen ' + Math.floor((Date.now()/1000 - (info.last_seen||0))/60) + 'm ago</span>'
+                : '';
+            d.innerHTML=`<b>${name}</b><span class="os">${os.length>30?os.substring(0,30)+'...':os}</span>${online_badge}${lastSeen}`;
+            d.onclick = () => {
+                if(info.status === 'offline') return;
+                sel(id, info.info || info);
+            };
             el.appendChild(d);
         });
     }catch(e){
@@ -1452,6 +1481,18 @@ async function sync(){
         const el=document.getElementById('clist');
         if(el) el.innerHTML='<div class="es">⚠️ ERROR: '+e.message+'</div>';
     }
+}
+function doDisconnect(){
+    clearViewerReconnect();
+    if(ws){ try{ ws.onclose=null; ws.close(); }catch(_e){} ws=null; }
+    aid=null;
+    document.getElementById('node_tag').style.display='none';
+    document.getElementById('node_tag').textContent='';
+    document.getElementById('disconnectBar').style.display='none';
+    const statusEl = document.getElementById('statusBar');
+    if(statusEl) statusEl.textContent='Status: disconnected';
+    const el=document.getElementById('clist');
+    if(el) el.querySelectorAll('.nd').forEach(n=>n.classList.remove('act'));
 }
 async function loadLogs(){
     try{
@@ -1517,7 +1558,15 @@ async def ws_client(websocket: WebSocket):
                 data = json.loads(payload)
                 if data.get("cmd") == CMD_REG:
                     device_id = data["data"]["id"]
-                    await state.set_client(device_id, ClientSession(websocket, data["data"]))
+                    info = data["data"]
+                    await state.set_client(device_id, ClientSession(websocket, info))
+                    known_clients[device_id] = {
+                        "hostname": info.get("hostname", "?"),
+                        "os": info.get("os", "?"),
+                        "status": "online",
+                        "first_seen": known_clients.get(device_id, {}).get("first_seen", time.time()),
+                        "last_seen": time.time(),
+                    }
                     udp_info = f" (UDP:{STREAM_PORT or 'auto'})" if STREAM_PORT != 0 else ""
                     logger.info(f"✅ Node registered: {data['data'].get('hostname', '?')} ({device_id[:8]}...){udp_info}")
                 elif device_id:
@@ -1532,6 +1581,9 @@ async def ws_client(websocket: WebSocket):
     finally:
         logger.info(f"❌ Node disconnected: {device_id[:8] if device_id else '?'}...")
         if device_id:
+            if device_id in known_clients:
+                known_clients[device_id]["status"] = "offline"
+                known_clients[device_id]["last_seen"] = time.time()
             await state.remove_client(device_id)
 
 
@@ -1617,6 +1669,11 @@ async def ws_viewer(websocket: WebSocket, device_id: str):
         session = await state.get_client(device_id)
         if session:
             session.viewers.discard(websocket)
+            if not session.viewers and not session.cam_viewers:
+                try:
+                    await session.agent_send_text(json.dumps({"cmd": CMD_VIEW, "args": {"mode": "none"}}))
+                except Exception:
+                    pass
 
 
 @app.websocket("/ws/viewer_cam/{device_id}")
@@ -1683,6 +1740,17 @@ async def root():
 @app.get("/clients")
 async def get_clients():
     return {cid: s.info for cid, s in state.clients.items()}
+
+
+@app.get("/known_clients")
+async def get_known_clients():
+    result = {}
+    for cid, info in known_clients.items():
+        result[cid] = dict(info)
+        session = state.clients.get(cid)
+        if session:
+            result[cid]["info"] = session.info
+    return result
 
 
 @app.get("/stats")
