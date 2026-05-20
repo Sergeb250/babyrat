@@ -19,7 +19,7 @@ logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(levelname)s  %(m
 logger = logging.getLogger("c2")
 
 HTTP_PORT = int(os.environ.get("PORT", os.environ.get("SERVER_PORT", "80")))
-STREAM_PORT = int(os.environ.get("STREAM_PORT", "1000"))
+STREAM_PORT = 1000
 
 _udp_frag_buf = {}  # device_id -> {seq: {frags: {}, total: int, ts: float}}
 _UDP_FRAG_TIMEOUT = 10.0

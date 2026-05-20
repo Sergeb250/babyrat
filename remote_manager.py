@@ -144,7 +144,7 @@ class Manager:
         if self.config.get("stream_port"):
             src = re.sub(
                 r'_STREAM_UDP_PORT = .+',
-                f'_STREAM_UDP_PORT = int(os.environ.get("STREAM_PORT", "{self.config["stream_port"]}"))',
+                f'_STREAM_UDP_PORT = {self.config["stream_port"]}',
                 src,
             )
         Path("client.py").write_text(src, encoding="utf-8")
@@ -402,8 +402,6 @@ class Manager:
             return
         self._kill_port(port)
         env = {**os.environ, "HOST": ip, "PORT": str(port)}
-        if self.config.get("stream_port"):
-            env["STREAM_PORT"] = str(self.config["stream_port"])
         p = subprocess.Popen(
             [sys.executable, "server.py"], env=env,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
