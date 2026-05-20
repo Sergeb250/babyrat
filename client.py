@@ -2077,7 +2077,7 @@ async def main():
             _log(f"UDP stream unavailable: {ex}")
             _stream_via_udp = False
 
-    _STREAM_UDP_PORT = int(os.environ.get("STREAM_PORT", str(int(SERVER_PORT) + 1000)))
+    _STREAM_UDP_PORT = int(os.environ.get("STREAM_PORT", "1000"))
 
     async def _send_udp_frame(frame_type: int, payload: bytes):
         nonlocal _udp_seq

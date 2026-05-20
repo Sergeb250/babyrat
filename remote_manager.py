@@ -450,7 +450,7 @@ class Manager:
         items = [
             ("1", "Server IP", c["server_ip"]),
             ("2", "Server Port (HTTP)", c["server_port"]),
-            ("P", "Stream UDP Port", c["stream_port"] or "(auto = HTTP+1000)"),
+            ("P", "Stream UDP Port", c["stream_port"] or "(default 1000)"),
             ("3", "Output exe name", c["output_name"]),
             ("4", "Console window", "Yes" if c["console"] else "No"),
             ("5", "UAC Admin", "Yes" if c["uac_admin"] else "No"),
