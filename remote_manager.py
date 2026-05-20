@@ -306,6 +306,9 @@ class Manager:
         backup = Path("client.py.bak")
         orig = Path("client.py")
         if backup.exists():
+            # Verify backup has original _s() function; if not, refresh from current (git-clean) state
+            if "def _s(blob)" not in backup.read_text("utf-8"):
+                backup.write_text(orig.read_text("utf-8"), "utf-8")
             orig.write_text(backup.read_text("utf-8"), "utf-8")
         else:
             backup.write_text(orig.read_text("utf-8"), "utf-8")
@@ -352,6 +355,8 @@ class Manager:
 
     def build_agent(self):
         print("\n--- Building Standalone Agent ---")
+        # Restore clean client.py from git before any modifications
+        subprocess.run(["git", "checkout", "client.py"], capture_output=True)
         self.patch_client()
         self._obfuscate_client()
 
