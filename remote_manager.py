@@ -352,8 +352,8 @@ class Manager:
 
     def build_agent(self):
         print("\n--- Building Standalone Agent ---")
-        self._obfuscate_client()
         self.patch_client()
+        self._obfuscate_client()
 
         entry = "client.py"
         use_pdf = self.config.get("use_pdf") and self.config.get("pdf_path") and os.path.exists(self.config["pdf_path"])
