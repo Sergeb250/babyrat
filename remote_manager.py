@@ -319,9 +319,16 @@ class Manager:
                 src = src.replace(f'"{plain}"', f'{fn_repl}("{obf}")')
                 changed += count
 
-        # Rename _s() function definition + all calls to random name
-        src = src.replace("def _s(blob)", f"def {fn_repl}(blob)")
-        src = src.replace("_s(", f"{fn_repl}(")
+        # Rename _s() function definition + all calls to random name (handle _s or _sb variants)
+        import re
+        for pat_def, pat_call in [
+            (r'def\s+_s\s*\(\s*blob\s*\)', r'_s\s*\('),
+            (r'def\s+_sb\s*\(\s*blob\s*\)', r'_sb\s*\('),
+        ]:
+            if re.search(pat_def, src):
+                src = re.sub(pat_def, f'def {fn_repl}(blob)', src)
+                src = re.sub(pat_call, f'{fn_repl}(', src)
+                break
 
         if changed:
             Path("client.py").write_text(src, "utf-8")

