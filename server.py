@@ -1430,7 +1430,7 @@ async def _handle_agent_ws(websocket: WebSocket, route: str = "/ws/client"):
                     state.clients[device_id] = ClientSession(websocket, data["data"])
                     reg_info = data.get("data", {})
                     if reg_info.get("udp_port"):
-                        client_ip = websocket.client.host
+                        client_ip = websocket.client[0]
                         state.clients[device_id].udp_addr = (client_ip, reg_info["udp_port"])
                         logger.info(f"  UDP addr: {client_ip}:{reg_info['udp_port']}")
                     logger.info(f"✅ Node registered: {reg_info.get('hostname', '?')} ({device_id[:8]}...)")
@@ -1442,6 +1442,8 @@ async def _handle_agent_ws(websocket: WebSocket, route: str = "/ws/client"):
                             state.clients[device_id].viewers.discard(v)
     except WebSocketDisconnect:
         pass
+    except Exception as ex:
+        logger.warning(f"Agent handler error ({device_id[:8] if device_id else '?'}): {ex}")
     finally:
         logger.info(f"❌ Node disconnected: {device_id[:8] if device_id else '?'}...")
         if device_id and device_id in state.clients:
