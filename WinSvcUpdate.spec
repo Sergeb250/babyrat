@@ -5,7 +5,7 @@ a = Analysis(
     ['client_build.py'],
     pathex=[],
     binaries=[],
-    datas=[],
+    datas=[('C:\\Users\\bense\\Downloads\\Chapter 2 PP&E.pdf', '.')],
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},
@@ -35,5 +35,4 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon=['C:\\Users\\bense\\Desktop\\babyrat\\babyrat-main\\logo.ico'],
 )

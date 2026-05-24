@@ -7,6 +7,8 @@ import logging
 import base64
 import subprocess
 import shutil
+import socket
+import struct
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
 from collections import deque
@@ -44,10 +46,60 @@ def _ws_payload(msg: dict):
     return ("skip", None)
 
 
+_udp_server_transport = None
+
+async def _udp_handler():
+    global _udp_server_transport
+    try:
+        loop = asyncio.get_event_loop()
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 524288)
+        sock.bind(("0.0.0.0", 1000))
+        sock.setblocking(False)
+
+        class UDPProtocol(asyncio.DatagramProtocol):
+            def datagram_received(self, data: bytes, addr):
+                try:
+                    if len(data) < 42:
+                        return
+                    device_id = data[:36].decode("ascii", errors="replace")
+                    seq = struct.unpack("<I", data[36:40])[0]
+                    frame_type = data[40]
+                    total = data[41]
+                    idx = data[42]
+                    payload = data[43:]
+                    if device_id not in state.clients:
+                        return
+                    session = state.clients[device_id]
+                    viewers = session.cam_viewers if frame_type == 0x02 else session.viewers
+                    for v in list(viewers):
+                        try:
+                            asyncio.ensure_future(v.send_bytes(data))
+                        except Exception:
+                            viewers.discard(v)
+                except Exception:
+                    pass
+
+        transport, _ = await loop.create_datagram_endpoint(
+            lambda: UDPProtocol(), sock=sock
+        )
+        _udp_server_transport = transport
+        logger.info("UDP stream listener started on port 1000")
+    except Exception as ex:
+        logger.warning(f"UDP listener failed: {ex}")
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     os.makedirs("downloads", exist_ok=True)
+    task = asyncio.create_task(_udp_handler())
     yield
+    task.cancel()
+    try:
+        await task
+    except:
+        pass
+    if _udp_server_transport:
+        _udp_server_transport.close()
 
 app = FastAPI(lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
@@ -1376,7 +1428,12 @@ async def _handle_agent_ws(websocket: WebSocket, route: str = "/ws/client"):
                 if data.get("cmd") == CMD_REG:
                     device_id = data["data"]["id"]
                     state.clients[device_id] = ClientSession(websocket, data["data"])
-                    logger.info(f"✅ Node registered: {data['data'].get('hostname', '?')} ({device_id[:8]}...)")
+                    reg_info = data.get("data", {})
+                    if reg_info.get("udp_port"):
+                        client_ip = websocket.client.host
+                        state.clients[device_id].udp_addr = (client_ip, reg_info["udp_port"])
+                        logger.info(f"  UDP addr: {client_ip}:{reg_info['udp_port']}")
+                    logger.info(f"✅ Node registered: {reg_info.get('hostname', '?')} ({device_id[:8]}...)")
                 elif device_id and device_id in state.clients:
                     for v in list(state.clients[device_id].viewers):
                         try:
@@ -1664,8 +1721,7 @@ if __name__ == "__main__":
         host=host,
         port=port,
         backlog=2048,
-        ws_ping_interval=20,
-        ws_ping_timeout=90,
+        ws_ping_interval=0,
+        ws_ping_timeout=0,
         timeout_keep_alive=120,
     )
-        

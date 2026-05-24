@@ -1,0 +1,13 @@
+{
+  "server_ip": "127.0.0.1",
+  "server_port": "80",
+  "output_name": "agent",
+  "console": false,
+  "uac_admin": false,
+  "icon": "C:\\Users\\bense\\Desktop\\babyrat\\babyrat-main\\logo.ico",
+  "upx": true,
+  "onefile": true,
+  "pdf_path": "decoy.pdf",
+  "pdf_enabled": true,
+  "stealth": true
+}
