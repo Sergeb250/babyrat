@@ -247,6 +247,10 @@ class Builder:
             f"--name={out_name}",
             build_file
         ]
+        # Ensure all required hidden imports are included
+        for _mod in ["mss", "PIL", "pynput.keyboard", "pynput.mouse",
+                      "sounddevice", "numpy", "cv2", "Crypto"]:
+            cmd.append(f"--hidden-import={_mod}")
         if not c["console"]:
             cmd.append("--noconsole")
         if c["onefile"]:

