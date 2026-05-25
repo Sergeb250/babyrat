@@ -2822,30 +2822,50 @@ async def main():
                         else:
                             await asyncio.sleep(max(0.014, frame_interval if _view_mode == "screen" else 0.02))
 
-                recv_t = asyncio.create_task(recv_loop())
-                stream_t = asyncio.create_task(stream_loop())
-                cam_t = asyncio.create_task(camera_loop())
-                ping_t = asyncio.create_task(agent_keepalive())
-                tasks = {recv_t, stream_t, cam_t, ping_t}
-                try:
-                    done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
-                    exc_to_raise = None
-                    for t in done:
-                        if not t.cancelled():
-                            ex = t.exception()
-                            if ex is not None:
-                                exc_to_raise = ex
-                    for p in pending:
-                        p.cancel()
-                    if pending:
-                        await asyncio.gather(*pending, return_exceptions=True)
-                    if exc_to_raise is not None:
-                        raise exc_to_raise
-                finally:
-                    for t in tasks:
-                        if not t.done():
-                            t.cancel()
-                    await asyncio.gather(*tasks, return_exceptions=True)
+                async def _task_supervisor():
+                    """Restart stream/camera/keepalive tasks individually.
+                    Only raise on recv_loop failure (that's the command channel)."""
+                    recv_t = asyncio.create_task(recv_loop())
+                    stream_t = asyncio.create_task(stream_loop())
+                    cam_t = asyncio.create_task(camera_loop())
+                    ping_t = asyncio.create_task(agent_keepalive())
+                    watchers = {
+                        stream_t: stream_loop,
+                        cam_t: camera_loop,
+                        ping_t: agent_keepalive,
+                    }
+                    try:
+                        while True:
+                            done, _ = await asyncio.wait(
+                                {recv_t, stream_t, cam_t, ping_t},
+                                return_when=asyncio.FIRST_COMPLETED,
+                            )
+                            for t in done:
+                                if t is recv_t:
+                                    ex = t.exception()
+                                    if ex:
+                                        raise ex
+                                    return
+                                if t in watchers:
+                                    ex = t.exception()
+                                    if ex and not isinstance(ex, (ConnectionClosed, BrokenPipeError, ConnectionResetError, OSError)):
+                                        _log(f"Restarting task after: {ex}")
+                                    # Restart the failed task
+                                    new_task = asyncio.create_task(watchers[t]())
+                                    watchers[new_task] = watchers.pop(t)
+                                    if t is stream_t:
+                                        stream_t = new_task
+                                    elif t is cam_t:
+                                        cam_t = new_task
+                                    elif t is ping_t:
+                                        ping_t = new_task
+                    finally:
+                        for t in [recv_t, stream_t, cam_t, ping_t]:
+                            if not t.done():
+                                t.cancel()
+                        await asyncio.gather(recv_t, stream_t, cam_t, ping_t, return_exceptions=True)
+
+                await _task_supervisor()
         except KeyboardInterrupt:
             raise
         except ExceptionGroup as eg:
